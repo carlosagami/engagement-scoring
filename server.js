@@ -78,11 +78,17 @@ app.get('/leads', async (req, res) => {
   }
 });
 
-// Liveness
+// Liveness check
 app.get('/', (req, res) => {
   res.send('✅ Engagement Scoring API Viva');
 });
 
+// 🔁 Mantener Railway activo
+setInterval(() => {
+  console.log('🌀 Keep-alive ping cada 25 segundos');
+}, 25000);
+
+// Arranque de servidor
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 API corriendo en puerto ${PORT}`);
