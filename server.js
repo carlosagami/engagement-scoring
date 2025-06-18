@@ -1,13 +1,16 @@
 const express = require('express');
 const { Pool } = require('pg');
 const dotenv = require('dotenv');
-const axios = require('axios');
-const { Parser } = require('json2csv');
+const bodyParser = require('body-parser');
+const { writeToPath } = require('fast-csv');
+const fs = require('fs');
+const path = require('path');
 
 dotenv.config();
-
 const app = express();
 const port = process.env.PORT || 8080;
+
+app.use(bodyParser.json());
 
 const pool = new Pool({
   host: process.env.PGHOST,
@@ -18,112 +21,91 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
-app.use(express.json());
+// Clasificación según score y días de última actividad
+function determinarSegmento(score, last_open) {
+  const hoy = new Date();
+  const ultima = new Date(last_open);
+  const diferencia = Math.floor((hoy - ultima) / (1000 * 60 * 60 * 24)); // días
 
-// Health check
-app.get('/', (req, res) => {
-  res.send('✅ Engagement Scoring API funcionando correctamente');
-});
+  if (score >= 10 && diferencia <= 7) return 'VIP';
+  if (score >= 4 && diferencia <= 15) return 'activo';
+  if (score >= 2 && diferencia <= 30) return 'dormido';
+  return 'zombie';
+}
 
-// Exportar leads como CSV
-app.get('/leads/csv', async (req, res) => {
-  try {
-    const { rows } = await pool.query('SELECT * FROM leads');
-    const parser = new Parser();
-    const csv = parser.parse(rows);
-    res.header('Content-Type', 'text/csv');
-    res.attachment('leads.csv');
-    res.send(csv);
-  } catch (err) {
-    console.error('❌ Error exportando CSV:', err.message);
-    res.status(500).send('Error exportando CSV');
-  }
-});
-
-// Webhook de Smartlead
+// Endpoint de Webhook
 app.post('/webhook', async (req, res) => {
-  const { event_type, to_email, event_timestamp } = req.body;
-  if (!to_email) return res.status(400).send('Email faltante');
-
-  const email = to_email.toLowerCase();
-  const event = event_type;
-  const timestamp = event_timestamp ? new Date(event_timestamp) : new Date();
-
-  let scoreDelta = 0;
-  let openIncrement = 0;
-  let clickIncrement = 0;
-
-  switch (event) {
-    case 'EMAIL_OPEN':
-      scoreDelta = 2;
-      openIncrement = 1;
-      break;
-    case 'EMAIL_CLICK':
-      scoreDelta = 4;
-      clickIncrement = 1;
-      break;
-    case 'EMAIL_REPLY':
-      scoreDelta = 10;
-      break;
-    default:
-      return res.status(200).send('Evento ignorado');
-  }
+  const { email, event_type } = req.body;
+  const client = await pool.connect();
 
   try {
-    const { rows } = await pool.query('SELECT * FROM leads WHERE email = $1', [email]);
-    const lead = rows[0];
-    let score = scoreDelta;
-    let openCount = openIncrement;
-    let clickCount = clickIncrement;
-    let lastOpen = event === 'EMAIL_OPEN' ? timestamp : null;
-    let lastClick = event === 'EMAIL_CLICK' ? timestamp : null;
-    let lastReply = event === 'EMAIL_REPLY' ? timestamp : null;
+    const { rows } = await client.query('SELECT * FROM leads WHERE email = $1', [email]);
+    if (rows.length === 0) return res.status(404).send('Lead no encontrado');
 
-    if (lead) {
-      score += lead.score;
-      openCount += lead.open_count || 0;
-      clickCount += lead.click_count || 0;
-      lastOpen = event === 'EMAIL_OPEN' ? timestamp : lead.last_open;
-      lastClick = event === 'EMAIL_CLICK' ? timestamp : lead.last_click;
-      lastReply = event === 'EMAIL_REPLY' ? timestamp : lead.last_reply;
+    const lead = rows[0];
+    let score = lead.score;
+    const now = new Date();
+
+    switch (event_type) {
+      case 'open':
+        score += 1;
+        await client.query(
+          'UPDATE leads SET open_count = open_count + 1, last_open = $1, score = $2 WHERE email = $3',
+          [now, score, email]
+        );
+        break;
+      case 'click':
+        score += 2;
+        await client.query(
+          'UPDATE leads SET click_count = click_count + 1, last_click = $1, score = $2 WHERE email = $3',
+          [now, score, email]
+        );
+        break;
+      case 'reply':
+        score += 3;
+        await client.query(
+          'UPDATE leads SET last_reply = $1, score = $2 WHERE email = $3',
+          [now, score, email]
+        );
+        break;
+      default:
+        return res.status(400).send('Evento no reconocido');
     }
 
-    // Clasificación
-    const lastActivity = lastReply || lastClick || lastOpen || timestamp;
-    const daysSince = Math.floor((Date.now() - new Date(lastActivity)) / (1000 * 60 * 60 * 24));
-    let segment = 'zombie';
+    const updated = await client.query('SELECT * FROM leads WHERE email = $1', [email]);
+    const nuevoSegmento = determinarSegmento(updated.rows[0].score, updated.rows[0].last_open);
+    await client.query('UPDATE leads SET segment = $1 WHERE email = $2', [nuevoSegmento, email]);
 
-    if (daysSince <= 7 && score >= 10) segment = 'VIP';
-    else if (daysSince <= 14 && score >= 4) segment = 'activo';
-    else if (daysSince <= 30 && score >= 1) segment = 'dormido';
-
-    await pool.query(
-      `INSERT INTO leads (email, score, open_count, click_count, last_open, last_click, last_reply, segment)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-       ON CONFLICT (email)
-       DO UPDATE SET
-         score = $2,
-         open_count = $3,
-         click_count = $4,
-         last_open = $5,
-         last_click = $6,
-         last_reply = $7,
-         segment = $8`,
-      [email, score, openCount, clickCount, lastOpen, lastClick, lastReply, segment]
-    );
-
-    console.log(`📬 ${event} registrado para ${email} → ${segment} (${score} pts)`);
-    res.status(200).send('OK');
+    console.log(`📬 ${event_type.toUpperCase()} registrado: ${email} → ${nuevoSegmento} (score ${score})`);
+    res.send(`✅ ${event_type} recibido para ${email}`);
   } catch (err) {
-    console.error('❌ Error en webhook:', err.message);
-    res.status(500).send('ERROR');
+    console.error('❌ Error procesando webhook:', err.message);
+    res.status(500).send('❌ Error interno del servidor');
+  } finally {
+    client.release();
   }
 });
 
-// Keep-alive
-setInterval(() => {
-  console.log('🌀 Keep-alive ping cada 25 segundos');
-}, 25 * 1000);
+// Exportar como CSV
+app.get('/export-leads', async (req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT * FROM leads');
+    const filePath = path.join(__dirname, 'leads.csv');
+
+    const stream = fs.createWriteStream(filePath);
+    writeToPath(filePath, rows, { headers: true }).pipe(stream);
+
+    stream.on('finish', () => {
+      res.download(filePath, 'leads.csv', () => fs.unlinkSync(filePath));
+    });
+  } catch (err) {
+    console.error('❌ Error exportando leads:', err.message);
+    res.status(500).send('❌ Error generando CSV');
+  }
+});
+
+// Health check
+app.get('/', (req, res) => res.send('✅ API funcionando correctamente'));
 
 app.listen(port, async () => {
   console.log(`🚀 API corriendo en puerto ${port}`);
@@ -134,3 +116,8 @@ app.listen(port, async () => {
     console.error('❌ Error conectando a PostgreSQL:', err.message);
   }
 });
+
+// Keep alive
+setInterval(() => {
+  console.log('🌀 Keep-alive ping cada 25 segundos');
+}, 25000);
