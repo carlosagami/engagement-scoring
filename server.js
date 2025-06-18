@@ -2,14 +2,13 @@ const express = require('express');
 const { Pool } = require('pg');
 const dotenv = require('dotenv');
 const axios = require('axios');
-const syncLeadIds = require('./sync-lead-ids'); // asegúrate que esté bien exportado
 
 dotenv.config();
 
 const app = express();
 const port = process.env.PORT || 8080;
 
-// PostgreSQL connection pool
+// PostgreSQL pool setup
 const pool = new Pool({
   host: process.env.PGHOST,
   user: process.env.PGUSER,
@@ -19,7 +18,7 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
-// Keep-alive ping
+// Keep-alive ping (cada 25 segundos)
 setInterval(() => {
   console.log('🌀 Keep-alive ping cada 25 segundos');
 }, 25 * 1000);
@@ -29,7 +28,7 @@ app.get('/', (req, res) => {
   res.send('✅ API funcionando correctamente');
 });
 
-// Verifica que se carga correctamente la API Key desde Railway
+// Verifica si la API Key está cargada desde variables de entorno
 app.get('/check-env', (req, res) => {
   const key = process.env.SMARTLEAD_API_KEY;
   if (key) {
@@ -39,38 +38,23 @@ app.get('/check-env', (req, res) => {
   }
 });
 
-// Endpoint para sincronizar Smartlead IDs desde leads globales
-app.get('/sync-lead-ids', async (req, res) => {
-  try {
-    await syncLeadIds();
-    res.send('✅ IDs sincronizados correctamente desde Smartlead');
-  } catch (err) {
-    console.error('❌ Error al sincronizar IDs desde Smartlead:', err.message);
-    res.status(500).send(`❌ Error al sincronizar IDs desde Smartlead: ${err.message}`);
-  }
-});
-
-// Prueba si la API Key de Smartlead está funcionando correctamente
+// TEST: Verifica si la API Key de Smartlead funciona correctamente
 app.get('/test-smartlead-key', async (req, res) => {
   const SMARTLEAD_API_KEY = process.env.SMARTLEAD_API_KEY;
 
   try {
-    const response = await axios.get('https://server.smartlead.ai/api/v1/leads', {
-      headers: {
-        'Authorization': `Bearer ${SMARTLEAD_API_KEY}`,
-        'Content-Type': 'application/json'
-      }
-    });
-
-    const count = Array.isArray(response.data) ? response.data.length : '?';
+    const response = await axios.get(`https://server.smartlead.ai/api/v1/leads?api_key=${SMARTLEAD_API_KEY}`);
+    const count = Array.isArray(response.data?.data) ? response.data.data.length : '?';
     res.send(`✅ Smartlead API Key funciona. Leads visibles: ${count}`);
   } catch (err) {
     console.error('❌ Error al probar Smartlead API:', err.response?.data || err.message);
-    res.status(500).send(`❌ Error al probar Smartlead API: ${JSON.stringify(err.response?.data || err.message)}`);
+    res
+      .status(500)
+      .send(`❌ Error al probar Smartlead API: ${JSON.stringify(err.response?.data || err.message)}`);
   }
 });
 
-// Inicializa el servidor
+// Inicia servidor y prueba conexión a PostgreSQL
 app.listen(port, async () => {
   console.log(`🚀 API corriendo en puerto ${port}`);
   try {
