@@ -1,5 +1,4 @@
 // Archivo: sync-lead-ids-from-campaigns.js
-
 const { Pool } = require('pg');
 const axios = require('axios');
 const dotenv = require('dotenv');
@@ -18,47 +17,49 @@ const pool = new Pool({
 const SMARTLEAD_API_KEY = process.env.SMARTLEAD_API_KEY;
 const SMARTLEAD_BASE_URL = 'https://app.smartlead.ai/api/v1';
 
-const getAllCampaigns = async () => {
-  const res = await axios.get(`${SMARTLEAD_BASE_URL}/campaigns`, {
-    headers: { Authorization: `Bearer ${SMARTLEAD_API_KEY}` }
-  });
-  return res.data.data;
-};
-
-const getLeadsFromCampaign = async (campaignId) => {
-  const res = await axios.get(`${SMARTLEAD_BASE_URL}/campaigns/${campaignId}/leads`, {
-    headers: { Authorization: `Bearer ${SMARTLEAD_API_KEY}` }
-  });
-  return res.data.data;
-};
-
 const syncLeadIdsFromCampaigns = async () => {
   try {
-    const { rows: localLeads } = await pool.query('SELECT * FROM leads WHERE smartlead_id IS NULL');
-    const emailsToUpdate = new Set(localLeads.map(l => l.email));
+    const campaignResp = await axios.get(`${SMARTLEAD_BASE_URL}/campaigns`, {
+      headers: { Authorization: `Bearer ${SMARTLEAD_API_KEY}` }
+    });
 
-    const campaigns = await getAllCampaigns();
-    let updatedCount = 0;
+    const campaigns = campaignResp.data?.data;
+    if (!Array.isArray(campaigns)) throw new Error('La respuesta de campañas no es un arreglo');
+
+    console.log(`📦 ${campaigns.length} campañas obtenidas`);
 
     for (const campaign of campaigns) {
-      const leads = await getLeadsFromCampaign(campaign.id);
+      const campaignId = campaign.id;
+      const campaignName = campaign.name;
+
+      console.log(`🔍 Leyendo leads de campaña: ${campaignName}`);
+
+      const leadsResp = await axios.get(`${SMARTLEAD_BASE_URL}/campaigns/${campaignId}/leads`, {
+        headers: { Authorization: `Bearer ${SMARTLEAD_API_KEY}` }
+      });
+
+      const leads = leadsResp.data?.data || [];
 
       for (const lead of leads) {
-        if (emailsToUpdate.has(lead.email)) {
-          await pool.query(
-            'UPDATE leads SET smartlead_id = $1 WHERE email = $2',
-            [lead.id, lead.email]
-          );
-          console.log(`✅ ID sincronizado: ${lead.email} → ${lead.id}`);
-          updatedCount++;
-        }
+        const email = lead.email;
+        const id = lead.id;
+
+        if (!email || !id) continue;
+
+        await pool.query(
+          `UPDATE leads SET smartlead_id = $1 WHERE email = $2 AND smartlead_id IS NULL`,
+          [id, email]
+        );
+
+        console.log(`✅ ${email} → ID: ${id}`);
       }
     }
 
-    console.log(`🎯 Sincronización terminada. Leads actualizados: ${updatedCount}`);
+    console.log('🎯 Sincronización de Smartlead IDs desde campañas finalizada.');
   } catch (err) {
     console.error('❌ Error sincronizando Smartlead IDs:', err.response?.data || err.message);
+    throw err;
   }
 };
 
-syncLeadIdsFromCampaigns();
+module.exports = { syncLeadIdsFromCampaigns };
