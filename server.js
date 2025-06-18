@@ -3,7 +3,8 @@
 const express = require('express');
 const { Pool } = require('pg');
 const dotenv = require('dotenv');
-const syncLeadIds = require('./sync-lead-ids'); // ✅ Importación correcta
+const syncLeadIds = require('./sync-lead-ids');
+const axios = require('axios');
 
 dotenv.config();
 
@@ -38,6 +39,29 @@ app.get('/sync-lead-ids', async (req, res) => {
   } catch (err) {
     console.error('❌ Error al sincronizar IDs desde Smartlead:', err.message);
     res.status(500).send('❌ Error al sincronizar IDs desde Smartlead');
+  }
+});
+
+// Endpoint para probar si la API Key de Smartlead es válida
+app.get('/test-smartlead-key', async (req, res) => {
+  const SMARTLEAD_API_KEY = process.env.SMARTLEAD_API_KEY;
+  const BASE_URL = 'https://server.smartlead.ai/api/v1';
+
+  try {
+    const response = await axios.get(`${BASE_URL}/leads`, {
+      headers: {
+        Authorization: `Bearer ${SMARTLEAD_API_KEY}`
+      }
+    });
+
+    if (!Array.isArray(response.data)) {
+      throw new Error('La respuesta no es un arreglo válido de leads');
+    }
+
+    res.send(`✅ ¡API Key válida! Leads obtenidos: ${response.data.length}`);
+  } catch (error) {
+    const msg = error.response?.data || error.message;
+    res.status(500).send(`❌ Error al probar Smartlead API: ${msg}`);
   }
 });
 
