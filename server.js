@@ -1,14 +1,16 @@
+// server.js
+
 const express = require('express');
 const { Pool } = require('pg');
 const dotenv = require('dotenv');
-const { syncCategories } = require('./sync-categories');
 const { syncLeadIds } = require('./sync-lead-ids');
 
 dotenv.config();
-const app = express();
-app.use(express.json());
 
-// Conexión a PostgreSQL
+const app = express();
+const port = process.env.PORT || 8080;
+
+// PostgreSQL pool setup
 const pool = new Pool({
   host: process.env.PGHOST,
   user: process.env.PGUSER,
@@ -18,102 +20,34 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
-// Verifica conexión al arrancar
-pool.connect()
-  .then(() => console.log('✅ Conexión exitosa a PostgreSQL'))
-  .catch(err => {
-    console.error('❌ Error de conexión a PostgreSQL:', err.message);
-    process.exit(1);
-  });
+// Keep-alive ping (cada 25 segundos)
+setInterval(() => {
+  console.log('🌀 Keep-alive ping cada 25 segundos');
+}, 25 * 1000);
 
-// Webhook para eventos de Smartlead
-app.post('/webhook', async (req, res) => {
-  console.log('🛰️ Webhook recibido:', JSON.stringify(req.body, null, 2));
-
-  const { event_type, to_email, event_timestamp } = req.body;
-
-  if (!to_email) return res.status(400).send('Missing to_email');
-  if (event_type !== 'EMAIL_OPEN') return res.status(200).send('IGNORED EVENT');
-
-  const email = to_email;
-  const openDate = event_timestamp ? new Date(event_timestamp) : new Date();
-
-  try {
-    const { rows } = await pool.query('SELECT * FROM leads WHERE email = $1', [email]);
-    let lead = rows[0];
-    let score = 2;
-    let segment = 'activo';
-
-    if (lead) {
-      score = lead.score + 2;
-      const lastOpen = new Date(lead.opens);
-      const days = Math.floor((new Date() - lastOpen) / (1000 * 60 * 60 * 24));
-
-      if (days >= 30 || score <= 0) segment = 'zombie';
-      else if (days >= 14) segment = 'dormido';
-      else if (score >= 10) segment = 'VIP';
-    }
-
-    await pool.query(
-      `INSERT INTO leads (email, opens, score, segment)
-       VALUES ($1, $2, $3, $4)
-       ON CONFLICT (email)
-       DO UPDATE SET opens = $2, score = $3, segment = $4`,
-      [email, openDate, score, segment]
-    );
-
-    console.log(`✅ Lead actualizado: ${email} → ${segment}`);
-    res.status(200).send('OK');
-  } catch (err) {
-    console.error('❌ Error al guardar lead:', err.message);
-    res.status(500).send('ERROR');
-  }
+// Health check
+app.get('/', (req, res) => {
+  res.send('✅ API funcionando correctamente');
 });
 
-// Endpoint para ver leads
-app.get('/leads', async (req, res) => {
-  try {
-    const { rows } = await pool.query('SELECT * FROM leads');
-    res.json(rows);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Endpoint para sincronizar Smartlead IDs (global)
+// Endpoint manual para sincronizar Smartlead IDs
 app.get('/sync-lead-ids', async (req, res) => {
   try {
     await syncLeadIds();
-    res.send('✅ IDs sincronizados correctamente');
+    res.send('✅ IDs sincronizados correctamente desde Smartlead');
   } catch (err) {
-    console.error('❌ Error al sincronizar IDs:', err.message);
-    res.status(500).send(`❌ Error al sincronizar IDs: ${err.message}`);
+    console.error('❌ Error al sincronizar IDs desde Smartlead:', err.message);
+    res.status(500).send('❌ Error al sincronizar IDs desde Smartlead');
   }
 });
 
-// Endpoint para sincronizar categorías
-app.get('/sync-categories', async (req, res) => {
+// Inicia servidor y prueba conexión a PostgreSQL
+app.listen(port, async () => {
+  console.log(`🚀 API corriendo en puerto ${port}`);
   try {
-    await syncCategories();
-    res.send('✅ Categorías sincronizadas correctamente');
+    await pool.query('SELECT NOW()');
+    console.log('✅ Conexión exitosa a PostgreSQL');
   } catch (err) {
-    console.error('❌ Error al sincronizar categorías:', err.message);
-    res.status(500).send('❌ Error al sincronizar categorías');
+    console.error('❌ Error conectando a PostgreSQL:', err.message);
   }
-});
-
-// Liveness
-app.get('/', (req, res) => {
-  res.send('✅ Engagement Scoring API Viva');
-});
-
-// Keep-alive
-setInterval(() => {
-  console.log('🌀 Keep-alive ping cada 25 segundos');
-}, 25000);
-
-// Inicia el servidor
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`🚀 API corriendo en puerto ${PORT}`);
 });
