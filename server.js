@@ -8,6 +8,7 @@ dotenv.config();
 const app = express();
 app.use(express.json());
 
+// Conexión a PostgreSQL
 const pool = new Pool({
   host: process.env.PGHOST,
   user: process.env.PGUSER,
@@ -24,9 +25,12 @@ pool.connect()
     process.exit(1);
   });
 
-// Webhook de Smartlead (ej: aperturas)
+// Webhook para eventos de Smartlead (ej: apertura)
 app.post('/webhook', async (req, res) => {
+  console.log('🛰️ Webhook recibido:', JSON.stringify(req.body, null, 2));
+
   const { event_type, to_email, event_timestamp } = req.body;
+
   if (!to_email) return res.status(400).send('Missing to_email');
   if (event_type !== 'EMAIL_OPEN') return res.status(200).send('IGNORED EVENT');
 
@@ -65,6 +69,7 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
+// Obtener todos los leads
 app.get('/leads', async (req, res) => {
   try {
     const { rows } = await pool.query('SELECT * FROM leads');
@@ -74,6 +79,7 @@ app.get('/leads', async (req, res) => {
   }
 });
 
+// Sincronizar categorías con Smartlead
 app.get('/sync-categories', async (req, res) => {
   try {
     await syncCategories();
@@ -84,24 +90,28 @@ app.get('/sync-categories', async (req, res) => {
   }
 });
 
+// Sincronizar Smartlead IDs desde campañas
 app.get('/sync-ids-campaigns', async (req, res) => {
   try {
     await syncLeadIdsFromCampaigns();
-    res.send('✅ IDs sincronizados desde campañas');
+    res.send('✅ Sincronización de IDs desde campañas completa');
   } catch (err) {
     console.error('❌ Error al sincronizar IDs desde campañas:', err.message);
     res.status(500).send('❌ Error al sincronizar IDs desde campañas');
   }
 });
 
+// Verificación de vida del servicio
 app.get('/', (req, res) => {
   res.send('✅ Engagement Scoring API Viva');
 });
 
+// Keep-alive
 setInterval(() => {
   console.log('🌀 Keep-alive ping cada 25 segundos');
 }, 25000);
 
+// Lanzamiento del servidor
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 API corriendo en puerto ${PORT}`);
