@@ -4,6 +4,7 @@ const dotenv = require('dotenv');
 
 dotenv.config();
 
+// Configura PostgreSQL
 const pool = new Pool({
   host: process.env.PGHOST,
   user: process.env.PGUSER,
@@ -13,43 +14,74 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
-const API_KEY = process.env.SMARTLEAD_API_KEY;
-const BASE = 'https://server.smartlead.ai/api/v1';
+// Configura API Smartlead
+const SMARTLEAD_API_KEY = process.env.SMARTLEAD_API_KEY;
+const SMARTLEAD_BASE_URL = 'https://app.smartlead.ai/api/v1';
 
 const getTagForLead = (lead) => {
   const now = new Date();
   const lastOpen = new Date(lead.opens);
   const days = Math.floor((now - lastOpen) / (1000 * 60 * 60 * 24));
+
   if (days >= 30 || lead.score <= 0) return 'zombie';
   if (days >= 15) return 'dormido';
   if (lead.score >= 10) return 'vip';
   return 'activo';
 };
 
-async function syncTags() {
-  const { rows } = await pool.query('SELECT * FROM leads');
-  for (const lead of rows) {
-    const tag = getTagForLead(lead);
-    console.log(`🔁 ${lead.email} → ${tag}`);
+const leadExists = async (email) => {
+  try {
+    const response = await axios.post(`${SMARTLEAD_BASE_URL}/contacts/email`, {
+      email
+    }, {
+      headers: {
+        Authorization: `Bearer ${SMARTLEAD_API_KEY}`
+      }
+    });
 
-    // Obtener lead_id
-    const getRes = await axios.get(
-      `${BASE}/leads?email=${encodeURIComponent(lead.email)}&api_key=${API_KEY}`
-    );
-    if (!getRes.data || !getRes.data.leads || getRes.data.leads.length === 0) {
-      console.warn(`⚠️ Lead no encontrado en Smartlead: ${lead.email}`);
-      continue;
-    }
-    const leadId = getRes.data.leads[0].id;
-
-    // Actualizar tags
-    await axios.post(
-      `${BASE}/leads/${leadId}/update-tags?api_key=${API_KEY}`,
-      { addTags: [tag] },
-      { headers: { 'Content-Type': 'application/json' } }
-    );
+    return response.status === 200 && response.data?.id;
+  } catch (err) {
+    console.warn(`⚠️ Error consultando existencia del lead (${email}):`, err.response?.status || err.message);
+    return false;
   }
-  console.log('✅ Tags sincronizadas.');
-}
+};
+
+const syncTags = async () => {
+  try {
+    const { rows } = await pool.query('SELECT * FROM leads');
+
+    for (const lead of rows) {
+      const tag = getTagForLead(lead);
+      const email = lead.email;
+
+      const exists = await leadExists(email);
+      if (!exists) {
+        console.warn(`⚠️ Lead no encontrado en Smartlead: ${email}`);
+        continue;
+      }
+
+      // Opcional: limpiar los demás tags que no aplican
+      const allTags = ['zombie', 'dormido', 'vip', 'activo'];
+      const tagsToRemove = allTags.filter(t => t !== tag);
+
+      console.log(`🔁 Syncing ${email} → ${tag}`);
+
+      await axios.post(`${SMARTLEAD_BASE_URL}/contacts/tag`, {
+        contactEmail: email,
+        addTags: [tag],
+        removeTags: tagsToRemove
+      }, {
+        headers: {
+          Authorization: `Bearer ${SMARTLEAD_API_KEY}`
+        }
+      });
+    }
+
+    console.log('✅ Tags sincronizadas exitosamente');
+  } catch (err) {
+    console.error('❌ Error al sincronizar tags:', err.message);
+    throw err;
+  }
+};
 
 module.exports = { syncTags };
