@@ -1,4 +1,4 @@
-// sync-lead-ids.js
+// sync-lead-ids.js.
 const { Pool } = require('pg');
 const axios = require('axios');
 require('dotenv').config();
