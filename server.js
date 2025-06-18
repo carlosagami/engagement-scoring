@@ -1,6 +1,7 @@
 const express = require('express');
 const { Pool } = require('pg');
 const dotenv = require('dotenv');
+const { syncTags } = require('./sync-tags'); // <-- Mueve esto arriba
 
 dotenv.config();
 const app = express();
@@ -83,6 +84,17 @@ app.get('/leads', async (req, res) => {
     res.json(rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// Endpoint para sincronizar tags manualmente
+app.get('/sync-tags', async (req, res) => {
+  try {
+    await syncTags();
+    res.send('✅ Tags sincronizadas correctamente');
+  } catch (err) {
+    console.error('❌ Error al sincronizar tags:', err.message);
+    res.status(500).send('❌ Error al sincronizar tags');
   }
 });
 
