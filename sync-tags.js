@@ -14,6 +14,7 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
+// Configura API Smartlead
 const SMARTLEAD_API_KEY = process.env.SMARTLEAD_API_KEY;
 const SMARTLEAD_BASE_URL = 'https://app.smartlead.ai/api/v1';
 
@@ -29,29 +30,35 @@ const getTagForLead = (lead) => {
 };
 
 const syncTags = async () => {
-  const { rows } = await pool.query('SELECT * FROM leads');
+  try {
+    const { rows } = await pool.query('SELECT * FROM leads');
 
-  for (const lead of rows) {
-    const tag = getTagForLead(lead);
-    const email = lead.email;
+    for (const lead of rows) {
+      const tag = getTagForLead(lead);
+      const email = lead.email;
 
-    const allTags = ['zombie', 'dormido', 'vip', 'activo'];
-    const tagsToRemove = allTags.filter(t => t !== tag);
+      const allTags = ['zombie', 'dormido', 'vip', 'activo'];
+      const tagsToRemove = allTags.filter(t => t !== tag);
 
-    console.log(`🔁 Syncing ${email} → ${tag}`);
+      console.log(`🔁 Syncing ${email} → ${tag}`);
 
-    await axios.post(`${SMARTLEAD_BASE_URL}/contacts/tag`, {
-      contactEmail: email,
-      addTags: [tag],
-      removeTags: tagsToRemove
-    }, {
-      headers: {
-        Authorization: `Bearer ${SMARTLEAD_API_KEY}`
-      }
-    });
+      await axios.post(`${SMARTLEAD_BASE_URL}/contacts/update-tags`, {
+        contactEmail: email,
+        addTags: [tag],
+        removeTags: tagsToRemove
+      }, {
+        headers: {
+          Authorization: `Bearer ${SMARTLEAD_API_KEY}`
+        }
+      });
+    }
+
+    console.log('✅ Tags sincronizadas exitosamente');
+    process.exit(0);
+  } catch (err) {
+    console.error('❌ Error al sincronizar tags:', err.response?.data || err.message);
+    process.exit(1);
   }
-
-  console.log('✅ Tags sincronizadas exitosamente');
 };
 
 module.exports = { syncTags };
