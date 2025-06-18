@@ -3,13 +3,12 @@ const { Pool } = require('pg');
 const dotenv = require('dotenv');
 const { syncCategories } = require('./sync-categories');
 const { syncLeadIds } = require('./sync-lead-ids');
-const { addGlobalLeads } = require('./add-global-leads'); // ✅ NUEVO
 
 dotenv.config();
 const app = express();
 app.use(express.json());
 
-// PostgreSQL
+// Conexión a PostgreSQL
 const pool = new Pool({
   host: process.env.PGHOST,
   user: process.env.PGUSER,
@@ -26,9 +25,10 @@ pool.connect()
     process.exit(1);
   });
 
-// Webhook de eventos Smartlead
+// Webhook para eventos de Smartlead (ej: apertura)
 app.post('/webhook', async (req, res) => {
   console.log('🛰️ Webhook recibido:', JSON.stringify(req.body, null, 2));
+
   const { event_type, to_email, event_timestamp } = req.body;
 
   if (!to_email) return res.status(400).send('Missing to_email');
@@ -69,7 +69,7 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// Endpoint para ver leads
+// Endpoint para ver todos los leads
 app.get('/leads', async (req, res) => {
   try {
     const { rows } = await pool.query('SELECT * FROM leads');
@@ -79,18 +79,7 @@ app.get('/leads', async (req, res) => {
   }
 });
 
-// ✅ Añadir leads globales a Smartlead
-app.get('/add-global-leads', async (req, res) => {
-  try {
-    await addGlobalLeads();
-    res.send('✅ Leads globales agregados correctamente');
-  } catch (err) {
-    console.error('❌ Error al agregar leads:', err.message);
-    res.status(500).send('❌ Error al agregar leads globales');
-  }
-});
-
-// ✅ Sincronizar Smartlead IDs
+// Endpoint para sincronizar Smartlead IDs (usando email → ID)
 app.get('/sync-lead-ids', async (req, res) => {
   try {
     await syncLeadIds();
@@ -101,7 +90,7 @@ app.get('/sync-lead-ids', async (req, res) => {
   }
 });
 
-// ✅ Sincronizar categorías
+// Endpoint para actualizar categoría del lead en Smartlead
 app.get('/sync-categories', async (req, res) => {
   try {
     await syncCategories();
