@@ -2,7 +2,7 @@ const express = require('express');
 const { Pool } = require('pg');
 const dotenv = require('dotenv');
 const { syncCategories } = require('./sync-categories');
-const { syncLeadIdsFromCampaigns } = require('./sync-lead-ids-from-campaigns');
+const { syncLeadIds } = require('./sync-lead-ids');
 
 dotenv.config();
 const app = express();
@@ -18,6 +18,7 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
+// Verifica conexión al arrancar
 pool.connect()
   .then(() => console.log('✅ Conexión exitosa a PostgreSQL'))
   .catch(err => {
@@ -25,7 +26,7 @@ pool.connect()
     process.exit(1);
   });
 
-// Webhook para eventos de Smartlead (ej: apertura)
+// Webhook para eventos de Smartlead
 app.post('/webhook', async (req, res) => {
   console.log('🛰️ Webhook recibido:', JSON.stringify(req.body, null, 2));
 
@@ -69,7 +70,7 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// Obtener todos los leads
+// Endpoint para ver leads
 app.get('/leads', async (req, res) => {
   try {
     const { rows } = await pool.query('SELECT * FROM leads');
@@ -79,7 +80,18 @@ app.get('/leads', async (req, res) => {
   }
 });
 
-// Sincronizar categorías con Smartlead
+// Endpoint para sincronizar Smartlead IDs (global)
+app.get('/sync-lead-ids', async (req, res) => {
+  try {
+    await syncLeadIds();
+    res.send('✅ IDs sincronizados correctamente');
+  } catch (err) {
+    console.error('❌ Error al sincronizar IDs:', err.message);
+    res.status(500).send(`❌ Error al sincronizar IDs: ${err.message}`);
+  }
+});
+
+// Endpoint para sincronizar categorías
 app.get('/sync-categories', async (req, res) => {
   try {
     await syncCategories();
@@ -90,18 +102,7 @@ app.get('/sync-categories', async (req, res) => {
   }
 });
 
-// Sincronizar Smartlead IDs desde campañas
-app.get('/sync-ids-campaigns', async (req, res) => {
-  try {
-    await syncLeadIdsFromCampaigns();
-    res.send('✅ Sincronización de IDs desde campañas completa');
-  } catch (err) {
-    console.error('❌ Error al sincronizar IDs desde campañas:', err.message);
-    res.status(500).send('❌ Error al sincronizar IDs desde campañas');
-  }
-});
-
-// Verificación de vida del servicio
+// Liveness
 app.get('/', (req, res) => {
   res.send('✅ Engagement Scoring API Viva');
 });
@@ -111,7 +112,7 @@ setInterval(() => {
   console.log('🌀 Keep-alive ping cada 25 segundos');
 }, 25000);
 
-// Lanzamiento del servidor
+// Inicia el servidor
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 API corriendo en puerto ${PORT}`);
