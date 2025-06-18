@@ -28,19 +28,20 @@ pool.connect()
 app.post('/webhook', async (req, res) => {
   console.log('🛰️ Webhook recibido:', JSON.stringify(req.body, null, 2));
 
-  const { event, email, timestamp } = req.body;
+  const { event_type, to_email, event_timestamp } = req.body;
 
-  if (!email) {
-    console.log('⚠️ Webhook sin email. Ignorado.');
-    return res.status(400).send('Missing email');
+  if (!to_email) {
+    console.log('⚠️ Webhook sin to_email. Ignorado.');
+    return res.status(400).send('Missing to_email');
   }
 
-  if (event !== 'EMAIL_OPENED') {
-    console.log(`⚠️ Evento no procesado: ${event}`);
+  if (event_type !== 'EMAIL_OPEN') {
+    console.log(`⚠️ Evento no procesado: ${event_type}`);
     return res.status(200).send('IGNORED EVENT');
   }
 
-  const openDate = timestamp ? new Date(timestamp) : new Date();
+  const email = to_email;
+  const openDate = event_timestamp ? new Date(event_timestamp) : new Date();
 
   try {
     const { rows } = await pool.query('SELECT * FROM leads WHERE email = $1', [email]);
