@@ -1,7 +1,8 @@
 const express = require('express');
 const { Pool } = require('pg');
 const dotenv = require('dotenv');
-const { syncTags } = require('./sync-tags'); // <-- Mueve esto arriba
+const { syncTags } = require('./sync-tags');
+const { syncCategories } = require('./sync-categories'); // <--- NUEVO
 
 dotenv.config();
 const app = express();
@@ -87,7 +88,7 @@ app.get('/leads', async (req, res) => {
   }
 });
 
-// Endpoint para sincronizar tags manualmente
+// Endpoint para sincronizar tags
 app.get('/sync-tags', async (req, res) => {
   try {
     await syncTags();
@@ -98,7 +99,18 @@ app.get('/sync-tags', async (req, res) => {
   }
 });
 
-// Endpoint de liveness
+// ✅ NUEVO endpoint para sincronizar categorías
+app.get('/sync-categories', async (req, res) => {
+  try {
+    await syncCategories();
+    res.send('✅ Categorías sincronizadas correctamente');
+  } catch (err) {
+    console.error('❌ Error al sincronizar categorías:', err.message);
+    res.status(500).send('❌ Error al sincronizar categorías');
+  }
+});
+
+// Liveness
 app.get('/', (req, res) => {
   res.send('✅ Engagement Scoring API Viva');
 });
@@ -108,6 +120,7 @@ setInterval(() => {
   console.log('🌀 Keep-alive ping cada 25 segundos');
 }, 25000);
 
+// Start
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 API corriendo en puerto ${PORT}`);
