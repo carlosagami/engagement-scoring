@@ -1,79 +1,76 @@
 const express = require('express');
-const fs = require('fs');
+const { Pool } = require('pg');
 const dotenv = require('dotenv');
-const path = require('path');
 
 dotenv.config();
 const app = express();
 app.use(express.json());
 
-const DB_PATH = path.join(__dirname, 'db.json');
-
-// Carga o inicializa base
-let db = {};
-if (fs.existsSync(DB_PATH)) {
-  db = JSON.parse(fs.readFileSync(DB_PATH));
-} else {
-  fs.writeFileSync(DB_PATH, JSON.stringify(db));
-}
-
-// 🔍 Log de cualquier petición
-app.use((req, res, next) => {
-  console.log('🛰️  Petición recibida:', req.method, req.originalUrl);
-  console.log('📦 Body:', JSON.stringify(req.body, null, 2));
-  next();
+// Conexión a PostgreSQL
+const pool = new Pool({
+  host: process.env.PGHOST,
+  user: process.env.PGUSER,
+  password: process.env.PGPASSWORD,
+  database: process.env.PGDATABASE,
+  port: process.env.PGPORT,
+  ssl: true
 });
 
 // Webhook principal
-app.post('/webhook', (req, res) => {
+app.post('/webhook', async (req, res) => {
   const { event, email, timestamp } = req.body;
 
-  if (event === 'EMAIL_OPENED' && email) {
-    const now = new Date();
-    const openTime = timestamp || now.toISOString();
-
-    if (!db[email]) {
-      db[email] = {
-        email,
-        opens: [],
-        score: 0,
-        segment: 'nuevo'
-      };
-    }
-
-    db[email].opens.push(openTime);
-    db[email].score += 2;
-
-    // Cálculo de segmentación
-    const lastOpen = new Date(db[email].opens[db[email].opens.length - 1]);
-    const daysSinceOpen = Math.floor((now - lastOpen) / (1000 * 60 * 60 * 24));
-
-    if (daysSinceOpen >= 30 || db[email].score <= 0) {
-      db[email].segment = 'zombie';
-    } else if (daysSinceOpen >= 14) {
-      db[email].segment = 'dormido';
-    } else if (db[email].score >= 10) {
-      db[email].segment = 'VIP';
-    } else {
-      db[email].segment = 'activo';
-    }
-
-    fs.writeFileSync(DB_PATH, JSON.stringify(db, null, 2));
-    console.log(`✅ Registro guardado para ${email} (${db[email].segment})`);
-  } else {
-    console.log('⚠️ Webhook recibido sin email o evento válido');
+  if (event !== 'EMAIL_OPENED' || !email) {
+    console.log('⚠️ Webhook ignorado');
+    return res.status(200).send('IGNORED');
   }
 
-  res.status(200).send('OK');
+  const openDate = timestamp ? new Date(timestamp) : new Date();
+
+  try {
+    const { rows } = await pool.query('SELECT * FROM leads WHERE email = $1', [email]);
+    let lead = rows[0];
+    let score = 2;
+    let segment = 'activo';
+
+    if (lead) {
+      score = lead.score + 2;
+
+      const lastOpen = new Date(lead.opens);
+      const days = Math.floor((new Date() - lastOpen) / (1000 * 60 * 60 * 24));
+
+      if (days >= 30 || score <= 0) segment = 'zombie';
+      else if (days >= 14) segment = 'dormido';
+      else if (score >= 10) segment = 'VIP';
+    }
+
+    await pool.query(
+      `INSERT INTO leads (email, opens, score, segment)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (email)
+       DO UPDATE SET opens = $2, score = $3, segment = $4`,
+      [email, openDate, score, segment]
+    );
+
+    console.log(`✅ Lead actualizado: ${email} → ${segment}`);
+    res.status(200).send('OK');
+  } catch (err) {
+    console.error('❌ Error al guardar lead:', err.message);
+    res.status(500).send('ERROR');
+  }
 });
 
 // Ver leads
-app.get('/leads', (req, res) => {
-  res.json(db);
+app.get('/leads', async (req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT * FROM leads');
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-// 🔥 IMPORTANTE: usar solo el puerto que Railway define
 const PORT = process.env.PORT;
 app.listen(PORT, () => {
-  console.log(`🚀 Servidor corriendo en puerto ${PORT}`);
+  console.log(`🚀 API corriendo en puerto ${PORT}`);
 });
