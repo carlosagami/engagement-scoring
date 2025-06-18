@@ -1,8 +1,8 @@
 const express = require('express');
 const { Pool } = require('pg');
 const dotenv = require('dotenv');
-const { syncCategories } = require('./sync-categories'); // ✅ Categorías
-const { syncLeadIds } = require('./sync-lead-ids');       // ✅ Lead IDs
+const { syncCategories } = require('./sync-categories');
+const { syncLeadIds } = require('./sync-lead-ids'); // ⬆️ Nuevo endpoint
 
 dotenv.config();
 const app = express();
@@ -25,21 +25,14 @@ pool.connect()
     process.exit(1);
   });
 
-// Webhook principal
+// Webhook para eventos de Smartlead (ej: apertura)
 app.post('/webhook', async (req, res) => {
   console.log('🛰️ Webhook recibido:', JSON.stringify(req.body, null, 2));
 
   const { event_type, to_email, event_timestamp } = req.body;
 
-  if (!to_email) {
-    console.log('⚠️ Webhook sin to_email. Ignorado.');
-    return res.status(400).send('Missing to_email');
-  }
-
-  if (event_type !== 'EMAIL_OPEN') {
-    console.log(`⚠️ Evento no procesado: ${event_type}`);
-    return res.status(200).send('IGNORED EVENT');
-  }
+  if (!to_email) return res.status(400).send('Missing to_email');
+  if (event_type !== 'EMAIL_OPEN') return res.status(200).send('IGNORED EVENT');
 
   const email = to_email;
   const openDate = event_timestamp ? new Date(event_timestamp) : new Date();
@@ -76,7 +69,7 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// Endpoint para ver leads
+// Endpoint para ver todos los leads
 app.get('/leads', async (req, res) => {
   try {
     const { rows } = await pool.query('SELECT * FROM leads');
@@ -86,18 +79,7 @@ app.get('/leads', async (req, res) => {
   }
 });
 
-// ✅ Sincronizar categorías en Smartlead
-app.get('/sync-categories', async (req, res) => {
-  try {
-    await syncCategories();
-    res.send('✅ Categorías sincronizadas correctamente');
-  } catch (err) {
-    console.error('❌ Error al sincronizar categorías:', err.message);
-    res.status(500).send('❌ Error al sincronizar categorías');
-  }
-});
-
-// ✅ Sincronizar IDs de Smartlead
+// Endpoint para sincronizar Smartlead IDs
 app.get('/sync-lead-ids', async (req, res) => {
   try {
     await syncLeadIds();
@@ -105,6 +87,17 @@ app.get('/sync-lead-ids', async (req, res) => {
   } catch (err) {
     console.error('❌ Error al sincronizar IDs:', err.message);
     res.status(500).send('❌ Error al sincronizar IDs');
+  }
+});
+
+// Endpoint para sincronizar categorías
+app.get('/sync-categories', async (req, res) => {
+  try {
+    await syncCategories();
+    res.send('✅ Categorías sincronizadas correctamente');
+  } catch (err) {
+    console.error('❌ Error al sincronizar categorías:', err.message);
+    res.status(500).send('❌ Error al sincronizar categorías');
   }
 });
 
@@ -118,7 +111,6 @@ setInterval(() => {
   console.log('🌀 Keep-alive ping cada 25 segundos');
 }, 25000);
 
-// Start
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 API corriendo en puerto ${PORT}`);
