@@ -13,63 +13,69 @@ const pool = new Pool({
 });
 
 const SMARTLEAD_API_KEY = process.env.SMARTLEAD_API_KEY;
-const BASE_URL = 'https://app.smartlead.ai/api/v1';
-
-// Verifica que sí existe una clave antes de llamar
-if (!SMARTLEAD_API_KEY) {
-  console.error('❌ SMARTLEAD_API_KEY no está definida en las variables de entorno');
-}
+const BASE_URL = 'https://server.smartlead.ai/api/v1';
 
 async function fetchAllSmartleadLeads() {
-  const resp = await axios.get(`${BASE_URL}/leads`, {
-    headers: {
-      Authorization: `Bearer ${SMARTLEAD_API_KEY}`
-    }
-  });
+  const allLeads = [];
+  let offset = 0;
+  const limit = 100;
 
-  if (!Array.isArray(resp.data?.data)) {
-    throw new Error('La respuesta de Smartlead no contiene un arreglo válido en data.data');
+  while (true) {
+    const resp = await axios.get(`${BASE_URL}/leads`, {
+      headers: { Authorization: `Bearer ${SMARTLEAD_API_KEY}` },
+      params: { limit, offset }
+    });
+
+    if (!Array.isArray(resp.data?.data)) {
+      throw new Error('Respuesta inesperada de Smartlead');
+    }
+
+    const batch = resp.data.data;
+    allLeads.push(...batch);
+    if (batch.length < limit) break;
+
+    offset += limit;
   }
 
-  return resp.data.data; // Smartlead wraps results in data.data
+  return allLeads;
 }
 
 async function syncLeadIds() {
-  const smartLeads = await fetchAllSmartleadLeads();
+  const slLeads = await fetchAllSmartleadLeads();
+  const local = await pool.query(
+    'SELECT email FROM leads WHERE smartlead_id IS NULL'
+  );
 
-  const { rows } = await pool.query('SELECT email FROM leads WHERE smartlead_id IS NULL');
   const updates = [];
-
-  for (const row of rows) {
-    const found = smartLeads.find(l => l.email?.toLowerCase() === row.email.toLowerCase());
+  local.rows.forEach(({ email }) => {
+    const found = slLeads.find(l => l.email?.toLowerCase() === email.toLowerCase());
     if (found) {
-      updates.push({ email: row.email, id: found.id });
+      updates.push({ email, id: found.id });
     }
-  }
+  });
 
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    for (const lead of updates) {
+    for (const u of updates) {
       await client.query(
         'UPDATE leads SET smartlead_id = $1 WHERE email = $2',
-        [lead.id, lead.email]
+        [u.id, u.email]
       );
-      console.log(`🔁 ID sincronizado: ${lead.email} → ${lead.id}`);
+      console.log('🔁 ID sincronizado:', u.email, '→', u.id);
     }
     await client.query('COMMIT');
-    console.log(`✅ ${updates.length} IDs sincronizados exitosamente.`);
+    console.log(`✅ IDs actualizados: ${updates.length}`);
   } catch (err) {
     await client.query('ROLLBACK');
-    console.error('❌ Error durante sincronización de IDs:', err.message);
     throw err;
   } finally {
     client.release();
   }
 
   if (updates.length === 0) {
-    console.log('ℹ️ No se encontraron leads pendientes de ID.');
+    console.log('ℹ️ No había leads sin ID para actualizar');
   }
 }
 
-module.exports = { syncLeadIds };
+module.exports = syncLeadIds;
