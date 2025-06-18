@@ -41,14 +41,20 @@ app.get('/sync-lead-ids', async (req, res) => {
   }
 });
 
-// Prueba de API Key de Smartlead con correo
+// Prueba de API Key y existencia del lead por email
 app.get('/test-smartlead-key', async (req, res) => {
   const SMARTLEAD_API_KEY = process.env.SMARTLEAD_API_KEY;
-  const testEmail = 'scarrera@netprime.com.mx'; // Cámbialo por un email real que esté en tu cuenta de Smartlead
+  const email = req.query.email;
+
+  if (!email) {
+    return res.status(400).send({
+      message: '"email" es requerido en query string. Ejemplo: ?email=ejemplo@correo.com'
+    });
+  }
 
   try {
     const response = await axios.get(
-      `https://server.smartlead.ai/api/v1/leads?email=${encodeURIComponent(testEmail)}&api_key=${SMARTLEAD_API_KEY}`
+      `https://server.smartlead.ai/api/v1/leads?email=${encodeURIComponent(email)}&api_key=${SMARTLEAD_API_KEY}`
     );
 
     const lead = response.data?.data?.[0];
@@ -56,13 +62,14 @@ app.get('/test-smartlead-key', async (req, res) => {
     if (lead) {
       res.send(`✅ Lead encontrado: ${lead.email} → ID: ${lead.id}`);
     } else {
-      res.send(`⚠️ Lead no encontrado para ${testEmail}`);
+      res.send(`⚠️ Lead no encontrado para ${email}`);
     }
   } catch (err) {
     console.error('❌ Error al probar Smartlead API:', err.response?.data || err.message);
-    res
-      .status(500)
-      .send(`❌ Error al probar Smartlead API: ${JSON.stringify(err.response?.data || err.message)}`);
+    res.status(500).send({
+      message: '❌ Error al probar Smartlead API',
+      details: err.response?.data || err.message
+    });
   }
 });
 
