@@ -1,8 +1,8 @@
 const express = require('express');
 const { Pool } = require('pg');
 const dotenv = require('dotenv');
-const { syncCategories } = require('./sync-categories');
-const { syncLeadIds } = require('./sync-lead-ids'); // ⬅️ NUEVO
+const { syncCategories } = require('./sync-categories'); // ✅ Categorías
+const { syncLeadIds } = require('./sync-lead-ids');       // ✅ Lead IDs
 
 dotenv.config();
 const app = express();
@@ -18,7 +18,6 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
-// Verifica conexión al arrancar
 pool.connect()
   .then(() => console.log('✅ Conexión exitosa a PostgreSQL'))
   .catch(err => {
@@ -53,7 +52,6 @@ app.post('/webhook', async (req, res) => {
 
     if (lead) {
       score = lead.score + 2;
-
       const lastOpen = new Date(lead.opens);
       const days = Math.floor((new Date() - lastOpen) / (1000 * 60 * 60 * 24));
 
@@ -78,7 +76,7 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// Endpoint para ver todos los leads (debug)
+// Endpoint para ver leads
 app.get('/leads', async (req, res) => {
   try {
     const { rows } = await pool.query('SELECT * FROM leads');
@@ -88,7 +86,7 @@ app.get('/leads', async (req, res) => {
   }
 });
 
-// Endpoint para sincronizar categorías de comportamiento con Smartlead
+// ✅ Sincronizar categorías en Smartlead
 app.get('/sync-categories', async (req, res) => {
   try {
     await syncCategories();
@@ -99,28 +97,28 @@ app.get('/sync-categories', async (req, res) => {
   }
 });
 
-// Endpoint para registrar smartlead_id (si falta)
+// ✅ Sincronizar IDs de Smartlead
 app.get('/sync-lead-ids', async (req, res) => {
   try {
     await syncLeadIds();
-    res.send('✅ Smartlead IDs sincronizados correctamente');
+    res.send('✅ IDs sincronizados correctamente');
   } catch (err) {
     console.error('❌ Error al sincronizar IDs:', err.message);
     res.status(500).send('❌ Error al sincronizar IDs');
   }
 });
 
-// Endpoint de liveness
+// Liveness
 app.get('/', (req, res) => {
   res.send('✅ Engagement Scoring API Viva');
 });
 
-// Keep-alive ping
+// Keep-alive
 setInterval(() => {
   console.log('🌀 Keep-alive ping cada 25 segundos');
 }, 25000);
 
-// Arranca el servidor
+// Start
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 API corriendo en puerto ${PORT}`);
