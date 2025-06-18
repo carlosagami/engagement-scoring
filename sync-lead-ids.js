@@ -45,8 +45,9 @@ const syncLeadIds = async () => {
 
     console.log('🎯 Sincronización de Smartlead IDs finalizada.');
   } catch (err) {
-    console.error('❌ Error:', err.response?.data || err.message);
+    console.error('❌ Error al sincronizar IDs:', err.response?.data || err.message);
+    throw err; // Para que el endpoint /sync-lead-ids pueda detectarlo
   }
 };
 
-syncLeadIds();
+module.exports = { syncLeadIds };
