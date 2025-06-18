@@ -1,4 +1,5 @@
-// sync-lead-ids.js.
+// sync-lead-ids.js
+
 const { Pool } = require('pg');
 const axios = require('axios');
 require('dotenv').config();
@@ -26,7 +27,7 @@ async function fetchAllSmartleadLeads() {
   return resp.data; // { id, email, ... }
 }
 
-async function syncLeadIdsGlobal() {
+async function syncLeadIds() {
   const slLeads = await fetchAllSmartleadLeads();
   const local = await pool.query(
     'SELECT email FROM leads WHERE smartlead_id IS NULL'
@@ -64,4 +65,4 @@ async function syncLeadIdsGlobal() {
   }
 }
 
-module.exports = syncLeadIdsGlobal;
+module.exports = syncLeadIds;
