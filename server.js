@@ -3,7 +3,7 @@
 const express = require('express');
 const { Pool } = require('pg');
 const dotenv = require('dotenv');
-const { syncLeadIds } = require('./sync-lead-ids');
+const syncLeadIds = require('./sync-lead-ids'); // ✅ Importación correcta
 
 dotenv.config();
 
