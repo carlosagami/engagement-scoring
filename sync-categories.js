@@ -16,7 +16,6 @@ const pool = new Pool({
 const SMARTLEAD_API_KEY = process.env.SMARTLEAD_API_KEY;
 const SMARTLEAD_BASE_URL = 'https://app.smartlead.ai/api/v1';
 
-// Calcula la categoría de un lead
 const getCategoryForLead = (lead) => {
   const now = new Date();
   const lastOpen = new Date(lead.opens);
@@ -30,38 +29,48 @@ const getCategoryForLead = (lead) => {
 
 const syncCategories = async () => {
   try {
-    const { rows } = await pool.query('SELECT * FROM leads');
+    const { rows: leads } = await pool.query('SELECT * FROM leads');
 
-    for (const lead of rows) {
-      const category = getCategoryForLead(lead);
+    for (const lead of leads) {
       const email = lead.email;
+      const category = getCategoryForLead(lead);
 
       console.log(`🔁 ${email} → ${category}`);
 
-      // Busca el lead en Smartlead por email
-      const getLeadResp = await axios.get(
-        `${SMARTLEAD_BASE_URL}/leads?email=${encodeURIComponent(email)}&api_key=${SMARTLEAD_API_KEY}`
-      );
+      try {
+        // 1. Obtener el lead por email
+        const getLeadResp = await axios.get(
+          `${SMARTLEAD_BASE_URL}/leads?email=${encodeURIComponent(email)}&api_key=${SMARTLEAD_API_KEY}`
+        );
 
-      const leadId = getLeadResp.data?.data?.[0]?.id;
-      if (!leadId) {
-        console.warn(`⚠️ Lead no encontrado en Smartlead: ${email}`);
-        continue;
-      }
-
-      // Actualiza la categoría del lead
-      await axios.post(
-        `${SMARTLEAD_BASE_URL}/leads/${leadId}/category`,
-        { category_name: category },
-        {
-          headers: { Authorization: `Bearer ${SMARTLEAD_API_KEY}` }
+        const leadData = getLeadResp.data?.data;
+        if (!Array.isArray(leadData) || leadData.length === 0) {
+          console.warn(`⚠️ Lead no encontrado en Smartlead: ${email}`);
+          continue;
         }
-      );
 
-      console.log(`✅ Categoría actualizada para ${email} → ${category}`);
+        const leadId = leadData[0].id;
+        if (!leadId) {
+          console.warn(`⚠️ Lead sin ID válido: ${email}`);
+          continue;
+        }
+
+        // 2. Actualizar categoría
+        await axios.post(
+          `${SMARTLEAD_BASE_URL}/leads/${leadId}/category`,
+          { category_name: category },
+          {
+            headers: { Authorization: `Bearer ${SMARTLEAD_API_KEY}` }
+          }
+        );
+
+        console.log(`✅ Categoría actualizada para ${email} → ${category}`);
+      } catch (innerErr) {
+        console.error(`❌ Error al procesar ${email}:`, innerErr.response?.data || innerErr.message);
+      }
     }
 
-    console.log('🎉 Sincronización completa.');
+    console.log('🎉 Sincronización de categorías completada.');
   } catch (err) {
     console.error('❌ Error general:', err.response?.data || err.message);
   }
