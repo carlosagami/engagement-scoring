@@ -44,7 +44,7 @@ app.get('/sync-lead-ids', async (req, res) => {
 // Prueba de API Key de Smartlead con correo
 app.get('/test-smartlead-key', async (req, res) => {
   const SMARTLEAD_API_KEY = process.env.SMARTLEAD_API_KEY;
-  const testEmail = 'carlosagami@gmail.com'; // Cámbialo por un email real que esté en tu cuenta de Smartlead
+  const testEmail = 'scarrera@netprime.com.mx'; // Cámbialo por un email real que esté en tu cuenta de Smartlead
 
   try {
     const response = await axios.get(
