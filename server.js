@@ -1,8 +1,7 @@
 const express = require('express');
 const { Pool } = require('pg');
 const dotenv = require('dotenv');
-const { syncTags } = require('./sync-tags');
-const { syncCategories } = require('./sync-categories'); // <--- NUEVO
+const { syncCategories } = require('./sync-categories'); // ✅ Categorías
 
 dotenv.config();
 const app = express();
@@ -88,18 +87,7 @@ app.get('/leads', async (req, res) => {
   }
 });
 
-// Endpoint para sincronizar tags
-app.get('/sync-tags', async (req, res) => {
-  try {
-    await syncTags();
-    res.send('✅ Tags sincronizadas correctamente');
-  } catch (err) {
-    console.error('❌ Error al sincronizar tags:', err.message);
-    res.status(500).send('❌ Error al sincronizar tags');
-  }
-});
-
-// ✅ NUEVO endpoint para sincronizar categorías
+// ✅ Endpoint para sincronizar categorías (engagement → Smartlead)
 app.get('/sync-categories', async (req, res) => {
   try {
     await syncCategories();
