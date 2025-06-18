@@ -35,9 +35,14 @@ const addGlobalLeads = async () => {
     console.log(`🚀 Enviando ${payload.length} leads globales a Smartlead...`);
 
     const response = await axios.post(
-      `${SMARTLEAD_BASE_URL}/leads/bulk`,
+      `${SMARTLEAD_BASE_URL}/leads`, // <- este endpoint es correcto
       { leads: payload },
-      { headers: { Authorization: `Bearer ${SMARTLEAD_API_KEY}` } }
+      {
+        headers: {
+          Authorization: `Bearer ${SMARTLEAD_API_KEY}`,
+          'Content-Type': 'application/json'
+        }
+      }
     );
 
     console.log('🎉 Leads agregados globalmente. Respuesta:', response.data);
