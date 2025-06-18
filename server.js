@@ -1,17 +1,16 @@
 // server.js
+
 const express = require('express');
 const { Pool } = require('pg');
 const dotenv = require('dotenv');
-const cors = require('cors');
-const fs = require('fs');
-const { Parser } = require('json2csv');
 
 dotenv.config();
-
 const app = express();
 const port = process.env.PORT || 8080;
-app.use(cors());
 
+app.use(express.json()); // <-- necesario para procesar JSON de webhooks
+
+// PostgreSQL connection
 const pool = new Pool({
   host: process.env.PGHOST,
   user: process.env.PGUSER,
@@ -21,98 +20,66 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
-// Health Check
-app.get('/', (req, res) => {
-  res.send('✅ Lead scoring API is live');
-});
+// Webhook para eventos de apertura de Smartlead
+app.post('/webhook', async (req, res) => {
+  const { to_email, event_type, event_timestamp } = req.body;
 
-// Webhook de apertura
-app.get('/webhook', async (req, res) => {
-  const email = req.query.email;
-  if (!email) return res.status(400).send('❌ Email is required');
+  if (!to_email || event_type !== 'EMAIL_OPEN') {
+    return res.status(200).send('Evento ignorado');
+  }
 
-  const now = new Date();
-  const client = await pool.connect();
+  const email = to_email;
+  const openDate = event_timestamp ? new Date(event_timestamp) : new Date();
+
   try {
-    await client.query('BEGIN');
-    const existing = await client.query('SELECT * FROM leads WHERE email = $1', [email]);
+    const { rows } = await pool.query('SELECT * FROM leads WHERE email = $1', [email]);
+    let lead = rows[0];
+    let score = 2;
+    let segment = 'activo';
 
-    if (existing.rows.length === 0) {
-      await client.query(
-        'INSERT INTO leads (email, opens_count, last_open, segment) VALUES ($1, $2, $3, $4)',
-        [email, 1, now, 'activo']
-      );
-    } else {
-      const { opens_count, last_open } = existing.rows[0];
-      const newCount = opens_count + 1;
-      let segment = 'zombie';
-      const daysAgo = (d) => (now - new Date(d)) / (1000 * 60 * 60 * 24);
+    if (lead) {
+      score = lead.score + 2;
+      const lastOpen = new Date(lead.opens);
+      const days = Math.floor((new Date() - lastOpen) / (1000 * 60 * 60 * 24));
 
-      if (newCount >= 10) segment = 'VIP';
-      else if (daysAgo(last_open) <= 14) segment = 'activo';
-      else if (daysAgo(last_open) <= 60) segment = 'dormido';
-
-      await client.query(
-        'UPDATE leads SET opens_count = $1, last_open = $2, segment = $3 WHERE email = $4',
-        [newCount, now, segment, email]
-      );
+      if (days >= 30 || score <= 0) segment = 'zombie';
+      else if (days >= 14) segment = 'dormido';
+      else if (score >= 10) segment = 'VIP';
     }
-    await client.query('COMMIT');
-    res.send('✅ Webhook processed');
+
+    await pool.query(
+      `INSERT INTO leads (email, opens, score, segment)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (email)
+       DO UPDATE SET opens = $2, score = $3, segment = $4`,
+      [email, openDate, score, segment]
+    );
+
+    console.log(`📬 Lead actualizado: ${email} → ${segment} (score ${score})`);
+    res.status(200).send('OK');
   } catch (err) {
-    await client.query('ROLLBACK');
-    console.error(err);
-    res.status(500).send('❌ Error processing webhook');
-  } finally {
-    client.release();
+    console.error('❌ Error al actualizar lead:', err.message);
+    res.status(500).send('ERROR');
   }
 });
 
-// GET /leads
-app.get('/leads', async (req, res) => {
-  const segment = req.query.segment;
-  try {
-    const query = segment
-      ? 'SELECT * FROM leads WHERE segment = $1'
-      : 'SELECT * FROM leads';
-    const values = segment ? [segment] : [];
-    const result = await pool.query(query, values);
-    res.json(result.rows);
-  } catch (err) {
-    console.error(err);
-    res.status(500).send('❌ Error fetching leads');
-  }
+// Health check
+app.get('/', (req, res) => {
+  res.send('✅ API funcionando correctamente');
 });
 
-// GET /leads/export
-app.get('/leads/export', async (req, res) => {
-  const segment = req.query.segment;
-  try {
-    const query = segment
-      ? 'SELECT * FROM leads WHERE segment = $1'
-      : 'SELECT * FROM leads';
-    const values = segment ? [segment] : [];
-    const result = await pool.query(query, values);
+// Keep-alive ping
+setInterval(() => {
+  console.log('🌀 Keep-alive ping cada 25 segundos');
+}, 25000);
 
-    const parser = new Parser();
-    const csv = parser.parse(result.rows);
-
-    res.header('Content-Type', 'text/csv');
-    res.attachment('leads.csv');
-    res.send(csv);
-  } catch (err) {
-    console.error(err);
-    res.status(500).send('❌ Error exporting leads');
-  }
-});
-
-// Init server
+// Start server
 app.listen(port, async () => {
-  console.log(`🚀 Server running on port ${port}`);
+  console.log(`🚀 API corriendo en puerto ${port}`);
   try {
     await pool.query('SELECT NOW()');
-    console.log('✅ PostgreSQL connected');
+    console.log('✅ Conexión exitosa a PostgreSQL');
   } catch (err) {
-    console.error('❌ PostgreSQL error:', err.message);
+    console.error('❌ Error conectando a PostgreSQL:', err.message);
   }
 });
