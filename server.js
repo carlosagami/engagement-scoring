@@ -26,11 +26,18 @@ pool.connect()
 
 // Webhook principal
 app.post('/webhook', async (req, res) => {
+  console.log('🛰️ Webhook recibido:', JSON.stringify(req.body, null, 2));
+
   const { event, email, timestamp } = req.body;
 
-  if (event !== 'EMAIL_OPENED' || !email) {
-    console.log('⚠️ Webhook ignorado');
-    return res.status(200).send('IGNORED');
+  if (!email) {
+    console.log('⚠️ Webhook sin email. Ignorado.');
+    return res.status(400).send('Missing email');
+  }
+
+  if (event !== 'EMAIL_OPENED') {
+    console.log(`⚠️ Evento no procesado: ${event}`);
+    return res.status(200).send('IGNORED EVENT');
   }
 
   const openDate = timestamp ? new Date(timestamp) : new Date();
@@ -68,7 +75,7 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// Consulta directa
+// Endpoint para ver leads
 app.get('/leads', async (req, res) => {
   try {
     const { rows } = await pool.query('SELECT * FROM leads');
@@ -78,17 +85,16 @@ app.get('/leads', async (req, res) => {
   }
 });
 
-// Liveness check
+// Endpoint de liveness
 app.get('/', (req, res) => {
   res.send('✅ Engagement Scoring API Viva');
 });
 
-// 🔁 Mantener Railway activo
+// Keep-alive
 setInterval(() => {
   console.log('🌀 Keep-alive ping cada 25 segundos');
 }, 25000);
 
-// Arranque de servidor
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 API corriendo en puerto ${PORT}`);
