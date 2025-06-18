@@ -1,125 +1,134 @@
 const express = require('express');
 const { Pool } = require('pg');
 const dotenv = require('dotenv');
-const bodyParser = require('body-parser');
-const { Parser } = require('json2csv');
+const { parseAsync } = require('json2csv');
 
 dotenv.config();
-
 const app = express();
 const port = process.env.PORT || 8080;
+app.use(express.json());
 
-app.use(bodyParser.json());
-
+// PostgreSQL pool
 const pool = new Pool({
   host: process.env.PGHOST,
   user: process.env.PGUSER,
   password: process.env.PGPASSWORD,
   database: process.env.PGDATABASE,
   port: process.env.PGPORT,
-  ssl: { rejectUnauthorized: false }
+  ssl: { rejectUnauthorized: false },
 });
+
+// Clasificación de segmentos por score
+function getSegment(score) {
+  if (score >= 10) return 'vip';
+  if (score >= 4) return 'activo';
+  if (score >= 2) return 'dormido';
+  return 'zombie';
+}
 
 // Health check
 app.get('/', (req, res) => {
   res.send('✅ API funcionando correctamente');
 });
 
-// 🧠 Clasificación basada en score
-function clasificarLead(score) {
-  if (score >= 10) return 'vip';
-  if (score >= 5) return 'activo';
-  if (score >= 1) return 'dormido';
-  return 'zombie';
-}
+// Keep-alive
+setInterval(() => {
+  console.log('🌀 Keep-alive ping cada 25 segundos');
+}, 25 * 1000);
 
-// 📬 Webhook principal
+// Webhook de eventos de Smartlead
 app.post('/webhook', async (req, res) => {
-  const { event_type, to_email, event_timestamp } = req.body;
-  if (!event_type || !to_email) return res.status(400).send('Faltan campos requeridos');
+  const event = req.body?.event;
+  const email = req.body?.lead?.email?.toLowerCase();
+  const now = new Date();
 
-  const client = await pool.connect();
+  if (!event || !email) return res.status(400).send('Faltan datos');
+
   try {
-    await client.query('BEGIN');
+    const { rows } = await pool.query('SELECT * FROM leads WHERE email = $1', [email]);
+    let lead = rows[0];
 
-    const { rows } = await client.query('SELECT * FROM leads WHERE email = $1', [to_email]);
-    const now = event_timestamp || new Date().toISOString();
-
-    if (rows.length === 0) {
-      await client.query(`
-        INSERT INTO leads (email, score, segment, send_count, open_count, click_count, last_sent, last_open, last_click, last_reply)
-        VALUES ($1, 0, 'zombie', 0, 0, 0, NULL, NULL, NULL, NULL)
-      `, [to_email]);
-    }
-
-    let scoreIncrement = 0;
-    const updates = [];
-    if (event_type === 'email_sent') {
-      updates.push(`send_count = send_count + 1`, `last_sent = '${now}'`);
-    }
-    if (event_type === 'email_open') {
-      updates.push(`open_count = open_count + 1`, `last_open = '${now}'`);
-      scoreIncrement += 2;
-    }
-    if (event_type === 'email_link_click') {
-      updates.push(`click_count = click_count + 1`, `last_click = '${now}'`);
-      scoreIncrement += 3;
-    }
-    if (event_type === 'email_reply') {
-      updates.push(`last_reply = '${now}'`);
-      scoreIncrement += 5;
+    if (!lead) {
+      await pool.query(
+        `INSERT INTO leads (email, score, segment, open_count, click_count)
+         VALUES ($1, 0, 'zombie', 0, 0)`,
+        [email]
+      );
+      lead = { email, score: 0, segment: 'zombie', open_count: 0, click_count: 0 };
+      console.log('🆕 Nuevo lead creado:', email);
     }
 
-    if (updates.length > 0) {
-      updates.push(`score = score + ${scoreIncrement}`);
-      updates.push(`segment = '${clasificarLead((rows[0]?.score || 0) + scoreIncrement)}'`);
-      await client.query(`
-        UPDATE leads
-        SET ${updates.join(', ')}
-        WHERE email = $1
-      `, [to_email]);
+    let updates = {};
+    let newScore = lead.score;
+
+    if (event === 'email_sent') {
+      updates.last_sent = now;
+      updates.send_count = (lead.send_count || 0) + 1;
     }
 
-    await client.query('COMMIT');
-    console.log(`📬 Evento procesado: ${event_type} → ${to_email}`);
-    res.sendStatus(200);
+    if (event === 'email_open') {
+      updates.last_open = now;
+      updates.open_count = (lead.open_count || 0) + 1;
+      newScore += 1;
+    }
+
+    if (event === 'email_link_click') {
+      updates.last_click = now;
+      updates.click_count = (lead.click_count || 0) + 1;
+      newScore += 2;
+    }
+
+    if (event === 'email_reply') {
+      updates.last_reply = now;
+      newScore += 3;
+    }
+
+    updates.score = newScore;
+    updates.segment = getSegment(newScore);
+
+    const fields = Object.keys(updates);
+    const values = Object.values(updates);
+    const setters = fields.map((f, i) => `${f} = $${i + 1}`);
+
+    await pool.query(
+      `UPDATE leads SET ${setters.join(', ')} WHERE email = $${fields.length + 1}`,
+      [...values, email]
+    );
+
+    console.log(`📬 Evento procesado: ${event} → ${email}`);
+    res.send('✅ Webhook recibido');
   } catch (err) {
-    await client.query('ROLLBACK');
-    console.error('❌ Error en webhook:', err.message);
-    res.status(500).send('Error en webhook');
-  } finally {
-    client.release();
+    console.error('❌ Error al procesar webhook:', err.message);
+    res.status(500).send('Error procesando webhook');
   }
 });
 
-// 🧾 Descargar tabla como CSV
-app.get('/leads/csv', async (req, res) => {
-  try {
-    const { rows } = await pool.query('SELECT * FROM leads ORDER BY email ASC');
-    const parser = new Parser();
-    const csv = parser.parse(rows);
-
-    res.header('Content-Type', 'text/csv');
-    res.attachment('leads.csv');
-    res.send(csv);
-  } catch (err) {
-    console.error('❌ Error al generar CSV:', err.message);
-    res.status(500).send('Error al generar CSV');
-  }
-});
-
-// 🧮 Ver leads en JSON desde navegador
+// Ver todos los leads
 app.get('/leads', async (req, res) => {
   try {
-    const { rows } = await pool.query('SELECT * FROM leads ORDER BY email ASC');
-    res.json(rows);
+    const result = await pool.query('SELECT * FROM leads ORDER BY score DESC');
+    res.json(result.rows);
   } catch (err) {
-    console.error('❌ Error al obtener leads:', err.message);
-    res.status(500).send('Error al obtener leads');
+    console.error('❌ Error obteniendo leads:', err.message);
+    res.status(500).send('Error obteniendo leads');
   }
 });
 
-// Iniciar servidor
+// Exportar leads como CSV
+app.get('/export-csv', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM leads ORDER BY score DESC');
+    const csv = await parseAsync(result.rows);
+    res.setHeader('Content-Disposition', 'attachment; filename="leads.csv"');
+    res.setHeader('Content-Type', 'text/csv');
+    res.send(csv);
+  } catch (err) {
+    console.error('❌ Error exportando CSV:', err.message);
+    res.status(500).send('Error exportando CSV');
+  }
+});
+
+// Inicia el servidor
 app.listen(port, async () => {
   console.log(`🚀 API corriendo en puerto ${port}`);
   try {
