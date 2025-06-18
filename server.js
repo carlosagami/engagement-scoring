@@ -1,7 +1,8 @@
 const express = require('express');
 const { Pool } = require('pg');
 const dotenv = require('dotenv');
-const { syncCategories } = require('./sync-categories'); // ✅ Categorías
+const { syncCategories } = require('./sync-categories');
+const { syncLeadIds } = require('./sync-lead-ids'); // ⬅️ NUEVO
 
 dotenv.config();
 const app = express();
@@ -77,7 +78,7 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// Endpoint para ver leads
+// Endpoint para ver todos los leads (debug)
 app.get('/leads', async (req, res) => {
   try {
     const { rows } = await pool.query('SELECT * FROM leads');
@@ -87,7 +88,7 @@ app.get('/leads', async (req, res) => {
   }
 });
 
-// ✅ Endpoint para sincronizar categorías (engagement → Smartlead)
+// Endpoint para sincronizar categorías de comportamiento con Smartlead
 app.get('/sync-categories', async (req, res) => {
   try {
     await syncCategories();
@@ -98,17 +99,28 @@ app.get('/sync-categories', async (req, res) => {
   }
 });
 
-// Liveness
+// Endpoint para registrar smartlead_id (si falta)
+app.get('/sync-lead-ids', async (req, res) => {
+  try {
+    await syncLeadIds();
+    res.send('✅ Smartlead IDs sincronizados correctamente');
+  } catch (err) {
+    console.error('❌ Error al sincronizar IDs:', err.message);
+    res.status(500).send('❌ Error al sincronizar IDs');
+  }
+});
+
+// Endpoint de liveness
 app.get('/', (req, res) => {
   res.send('✅ Engagement Scoring API Viva');
 });
 
-// Keep-alive
+// Keep-alive ping
 setInterval(() => {
   console.log('🌀 Keep-alive ping cada 25 segundos');
 }, 25000);
 
-// Start
+// Arranca el servidor
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 API corriendo en puerto ${PORT}`);
