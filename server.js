@@ -13,8 +13,16 @@ const pool = new Pool({
   password: process.env.PGPASSWORD,
   database: process.env.PGDATABASE,
   port: process.env.PGPORT,
-  ssl: true
+  ssl: { rejectUnauthorized: false }
 });
+
+// Verifica conexión al arrancar
+pool.connect()
+  .then(() => console.log('✅ Conexión exitosa a PostgreSQL'))
+  .catch(err => {
+    console.error('❌ Error de conexión a PostgreSQL:', err.message);
+    process.exit(1);
+  });
 
 // Webhook principal
 app.post('/webhook', async (req, res) => {
@@ -60,7 +68,7 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// Ver leads
+// Consulta directa
 app.get('/leads', async (req, res) => {
   try {
     const { rows } = await pool.query('SELECT * FROM leads');
@@ -70,7 +78,12 @@ app.get('/leads', async (req, res) => {
   }
 });
 
-const PORT = process.env.PORT;
+// Liveness
+app.get('/', (req, res) => {
+  res.send('✅ Engagement Scoring API Viva');
+});
+
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 API corriendo en puerto ${PORT}`);
 });
