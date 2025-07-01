@@ -1,5 +1,3 @@
-// server.js
-
 const express = require('express');
 const { Pool } = require('pg');
 const dotenv = require('dotenv');
@@ -29,6 +27,7 @@ app.get('/', (req, res) => {
   res.send('✅ API funcionando correctamente');
 });
 
+// Ver todos los leads
 app.get('/leads', async (req, res) => {
   try {
     const { rows } = await pool.query('SELECT * FROM leads ORDER BY email');
@@ -39,7 +38,7 @@ app.get('/leads', async (req, res) => {
   }
 });
 
-// ✅ Ver un lead individual
+// Ver un lead individual
 app.get('/leads/:email', async (req, res) => {
   const { email } = req.params;
   try {
@@ -52,11 +51,10 @@ app.get('/leads/:email', async (req, res) => {
   }
 });
 
-// ✅ Webhook
+// Webhook para registrar eventos
 app.post('/webhook', async (req, res) => {
   const data = req.body;
 
-  // 🔍 Intentamos detectar formato plano o anidado
   const event_type = (data.event_type || data.eventType || '').toLowerCase();
   const email = data.email || data.to_email;
   const timestamp = data.timestamp || data.time_sent || data.event_timestamp || new Date().toISOString();
@@ -82,42 +80,55 @@ app.post('/webhook', async (req, res) => {
     }
 
     let updates = [];
+    let values = [email];
+    let valueIndex = 2;
     let newScore = lead.score;
     let segment = lead.segment;
 
     if (event_type === 'email_open') {
       updates.push(`open_count = open_count + 1`);
-      updates.push(`last_open = $2`);
+      updates.push(`last_open = $${valueIndex}`);
+      values.push(now);
+      valueIndex++;
       newScore += 1;
     }
 
     if (event_type === 'email_click') {
       updates.push(`click_count = click_count + 1`);
-      updates.push(`last_click = $2`);
+      updates.push(`last_click = $${valueIndex}`);
+      values.push(now);
+      valueIndex++;
       newScore += 2;
     }
 
     if (event_type === 'email_reply') {
-      updates.push(`last_reply = $2`);
+      updates.push(`last_reply = $${valueIndex}`);
+      values.push(now);
+      valueIndex++;
       newScore += 3;
     }
 
     if (event_type === 'email_sent') {
       updates.push(`send_count = COALESCE(send_count, 0) + 1`);
-      updates.push(`last_sent = $2`);
+      updates.push(`last_sent = $${valueIndex}`);
+      values.push(now);
+      valueIndex++;
     }
 
-    // Recalcular segmento
     if (newScore >= 10) segment = 'vip';
     else if (newScore >= 5) segment = 'activo';
     else if (newScore >= 2) segment = 'dormido';
     else segment = 'zombie';
 
-    updates.push(`score = $3`);
-    updates.push(`segment = $4`);
+    updates.push(`score = $${valueIndex}`);
+    values.push(newScore);
+    valueIndex++;
+
+    updates.push(`segment = $${valueIndex}`);
+    values.push(segment);
 
     const query = `UPDATE leads SET ${updates.join(', ')} WHERE email = $1`;
-    await pool.query(query, [email, now, newScore, segment]);
+    await pool.query(query, values);
 
     console.log(`✅ Lead actualizado: ${email} → ${segment} (score ${newScore})`);
     res.send(`✅ Lead actualizado: ${email} → ${segment}`);
