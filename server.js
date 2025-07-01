@@ -29,7 +29,6 @@ app.get('/', (req, res) => {
   res.send('✅ API funcionando correctamente');
 });
 
-// ✅ Ver todos los leads
 app.get('/leads', async (req, res) => {
   try {
     const { rows } = await pool.query('SELECT * FROM leads ORDER BY email');
@@ -40,14 +39,31 @@ app.get('/leads', async (req, res) => {
   }
 });
 
-// ✅ Webhook para registrar eventos de Smartlead
-app.post('/webhook', async (req, res) => {
-  const { event_type, email, timestamp, campaign_id, subject } = req.body;
+// ✅ Ver un lead individual
+app.get('/leads/:email', async (req, res) => {
+  const { email } = req.params;
+  try {
+    const { rows } = await pool.query('SELECT * FROM leads WHERE email = $1', [email]);
+    if (rows.length === 0) return res.status(404).send('Lead no encontrado');
+    res.json(rows[0]);
+  } catch (err) {
+    console.error('❌ Error al obtener lead:', err.message);
+    res.status(500).send('Error al obtener lead');
+  }
+});
 
-  console.log('📩 Webhook recibido:', req.body);
+// ✅ Webhook
+app.post('/webhook', async (req, res) => {
+  const data = req.body;
+
+  // 🔍 Intentamos detectar formato plano o anidado
+  const event_type = (data.event_type || data.eventType || '').toLowerCase();
+  const email = data.email || data.to_email;
+  const timestamp = data.timestamp || data.time_sent || data.event_timestamp || new Date().toISOString();
 
   if (!event_type || !email || !timestamp) {
-    return res.status(400).send('Faltan datos');
+    console.log('⚠️ Webhook ignorado por falta de datos clave:', { event_type, email, timestamp });
+    return res.status(400).send('Faltan datos clave');
   }
 
   const now = new Date(timestamp);
@@ -91,7 +107,7 @@ app.post('/webhook', async (req, res) => {
       updates.push(`last_sent = $2`);
     }
 
-    // Clasificación
+    // Recalcular segmento
     if (newScore >= 10) segment = 'vip';
     else if (newScore >= 5) segment = 'activo';
     else if (newScore >= 2) segment = 'dormido';
@@ -101,7 +117,6 @@ app.post('/webhook', async (req, res) => {
     updates.push(`segment = $4`);
 
     const query = `UPDATE leads SET ${updates.join(', ')} WHERE email = $1`;
-
     await pool.query(query, [email, now, newScore, segment]);
 
     console.log(`✅ Lead actualizado: ${email} → ${segment} (score ${newScore})`);
