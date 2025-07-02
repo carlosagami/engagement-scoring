@@ -2,6 +2,8 @@ const express = require('express');
 const { Pool } = require('pg');
 const dotenv = require('dotenv');
 const bodyParser = require('body-parser');
+const { Parser } = require('json2csv'); // ← NUEVO para exportar CSV
+
 dotenv.config();
 
 const app = express();
@@ -27,7 +29,7 @@ app.get('/', (req, res) => {
   res.send('✅ API funcionando correctamente');
 });
 
-// Ver todos los leads
+// Ver todos los leads (JSON)
 app.get('/leads', async (req, res) => {
   try {
     const { rows } = await pool.query('SELECT * FROM leads ORDER BY email');
@@ -35,6 +37,22 @@ app.get('/leads', async (req, res) => {
   } catch (err) {
     console.error('❌ Error al obtener leads:', err.message);
     res.status(500).send('Error al obtener leads');
+  }
+});
+
+// 🔽 NUEVO: Descargar leads como CSV
+app.get('/leads.csv', async (req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT * FROM leads ORDER BY email');
+    const parser = new Parser();
+    const csv = parser.parse(rows);
+
+    res.header('Content-Type', 'text/csv');
+    res.attachment('leads.csv');
+    res.send(csv);
+  } catch (err) {
+    console.error('❌ Error al generar CSV:', err.message);
+    res.status(500).send('Error al generar CSV');
   }
 });
 
