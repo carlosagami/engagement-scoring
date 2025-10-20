@@ -22,19 +22,32 @@ const pool = new Pool({
 
 /* ================= Helpers anti-falsos y utilidades ================= */
 
+// Proxies / escáneres conocidos (Gmail proxy, Apple MPP, gateways de seguridad, etc.)
 function looksLikeProxyUA(ua = '') {
   const s = ua.toLowerCase();
-  return /(googleimageproxy|google|mpp|apple|icloud|outlook|microsoft|office|yahoo|aol|proofpoint|mimecast|barracuda|trendmicro|symantec|sophos)/i.test(s);
-}
-function looksLikeHumanUA(ua = '') {
-  const s = ua.toLowerCase();
-  // Señales de dispositivos/navegadores reales (no proxy)
-  return /(iphone|ipad|android|windows nt|macintosh|linux).*?(chrome|safari|firefox|edge)/i.test(s);
+  return /(googleimageproxy|google proxy|mpp|apple|icloud|outlook-httpproxy|outlookimgcache|microsoft-httpproxy|office365-httpproxy|proofpoint|mimecast|barracuda|trendmicro|symantec|sophos)/i.test(s);
 }
 function looksLikeProxyIP(ip = '') {
   const s = String(ip).toLowerCase();
-  return /(google|microsoft|outlook|office|icloud|apple|yahoo|aol)/i.test(s);
+  // Nota: esto es heurístico; lo fino viene de UA. Mantenemos por si headers traen hints.
+  return /(google|microsoft|outlook|office|icloud|apple|yahoo|aol|proofpoint|mimecast)/i.test(s);
 }
+
+// Señales de **usuario real**: navegadores comunes y **Outlook real** (desktop/web) en Windows/macOS
+function looksLikeHumanUA(ua = '') {
+  const s = ua.toLowerCase();
+  return (
+    // Navegadores reales (desktop/móvil)
+    /(iphone|ipad|android|windows nt|macintosh|linux).*?(chrome|safari|firefox|edge)/i.test(s)
+    ||
+    // Outlook de escritorio y variantes MSHTML/Trident (Windows)
+    /(microsoft outlook|ms-office|office|msie|trident\/\d+\.\d+)/i.test(s)
+    ||
+    // Outlook Web App / O365 vía navegador (lleva mozilla/windows y "outlook")
+    /(mozilla\/5\.0).*?(windows nt|macintosh).*?(outlook)/i.test(s)
+  );
+}
+
 function sameDay(a, b) {
   if (!a || !b) return false;
   const A = new Date(a), B = new Date(b);
@@ -111,7 +124,7 @@ app.post('/webhook', async (req, res) => {
   const ua = (data.user_agent || req.headers['user-agent'] || '');
   const ip = (data.ip || req.headers['x-forwarded-for'] || req.ip || '').toString();
 
-  // Idempotencia (tabla lead_events_dedup ya creada)
+  // Idempotencia
   const eventId = data.event_id || data.id || `${email}-${event_type}-${eventAt.getTime()}`;
   try {
     await pool.query(
@@ -140,7 +153,7 @@ app.post('/webhook', async (req, res) => {
     }
     const lead = r.rows[0];
 
-    // Heurística prudente (no penaliza “aperturas humanas inmediatas”)
+    // Heurística prudente (no penaliza aperturas humanas inmediatas)
     const uaIsProxy = looksLikeProxyUA(ua);
     const ipIsProxy = looksLikeProxyIP(ip);
     const uaIsHuman = looksLikeHumanUA(ua);
@@ -151,7 +164,7 @@ app.post('/webhook', async (req, res) => {
     const tooFast = secondsSinceSend !== null && secondsSinceSend < 12; // apoyo; nunca criterio único
     const sameDayDup = sameDay(lastOpenV2, eventAt);
 
-    // Solo sospechoso si huele a proxy; el tiempo solo refuerza si hay proxy.
+    // Solo marcamos sospechoso si huele a proxy; el tiempo solo refuerza si hay proxy.
     const suspiciousOpen =
       event_type === 'email_open' &&
       (uaIsProxy || ipIsProxy || (tooFast && (uaIsProxy || ipIsProxy)));
@@ -178,7 +191,10 @@ app.post('/webhook', async (req, res) => {
         // Apertura humana o al menos no-proxy. Evita duplicar score el mismo día.
         if (!sameDayDup) {
           updates.push(`open_count_v2 = COALESCE(open_count_v2,0) + 1`);
-          updates.push(`human_open_count = COALESCE(human_open_count,0) + 1`);
+          // Solo sumamos "human_open_count" cuando el UA parece humano (incluye Outlook real).
+          if (uaIsHuman && !uaIsProxy) {
+            updates.push(`human_open_count = COALESCE(human_open_count,0) + 1`);
+          }
           newScore += 1;
         }
       }
@@ -210,7 +226,7 @@ app.post('/webhook', async (req, res) => {
       (lead.reply_count_v2 > 0 || event_type === 'email_reply') ||
       (lead.click_count_v2 > 0 || event_type === 'email_click') ||
       (
-        ((lead.human_open_count || 0) + ((event_type === 'email_open' && !suspiciousOpen && !sameDayDup) ? 1 : 0)) >= 2
+        ((lead.human_open_count || 0) + ((event_type === 'email_open' && !suspiciousOpen && !sameDayDup && uaIsHuman && !uaIsProxy) ? 1 : 0)) >= 2
       );
 
     if (humanSignals && newScore >= 12)      segment = 'vip';
@@ -226,12 +242,12 @@ app.post('/webhook', async (req, res) => {
       await pool.query(sql, values);
     }
 
-    console.log(
-      `v2 ✅ ${email} → ${segment} (score_v2 ${newScore})` +
-      (event_type === 'email_open'
-        ? ` | open ${suspiciousOpen ? '🤖 sospechoso' : (uaIsHuman ? '🧑 humano' : 'no-proxy')}${sameDayDup ? ' (dup día)' : ''}`
-        : '')
-    );
+    const label =
+      event_type === 'email_open'
+        ? (suspiciousOpen ? '🤖 sospechoso' : (uaIsHuman ? '🧑 humano' : 'no-proxy'))
+        : event_type;
+
+    console.log(`v2 ✅ ${email} → ${segment} (score_v2 ${newScore}) | ${event_type === 'email_open' ? `open ${label}${sameDayDup ? ' (dup día)' : ''}` : event_type}`);
     res.send('OK');
   } catch (err) {
     console.error('❌ Error al procesar webhook v2:', err.message);
