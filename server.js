@@ -1,54 +1,57 @@
-const express = require('express');
-const { Pool } = require('pg');
-const dotenv = require('dotenv');
-const bodyParser = require('body-parser');
-const { Parser } = require('json2csv');
+// ======================= ESP Server (final) =======================
+// - Webhook /webhook (Smartlead): en v2 SOLO suma si el UA es humano
+// - Píxel /o.gif: registra SIEMPRE apertura humana real (UA/IP del lector)
+// - Rutas lectura: /, /leads, /leads.csv, /leads/:email
+// - Idempotencia con lead_events_dedup
+// - Almacén de auditoría en lead_open_events_v2
+// ================================================================
+
+const express   = require('express');
+const { Pool }  = require('pg');
+const dotenv    = require('dotenv');
+const bodyParser= require('body-parser');
+const { Parser }= require('json2csv');
 
 dotenv.config();
 
-const app = express();
+const app  = express();
 const port = process.env.PORT || 8080;
 
 app.use(bodyParser.json());
 
 const pool = new Pool({
-  host: process.env.PGHOST,
-  user: process.env.PGUSER,
+  host:     process.env.PGHOST,
+  user:     process.env.PGUSER,
   password: process.env.PGPASSWORD,
   database: process.env.PGDATABASE,
-  port: process.env.PGPORT,
-  ssl: { rejectUnauthorized: false }
+  port:     process.env.PGPORT,
+  ssl:      { rejectUnauthorized: false }
 });
 
-/* ================= Heurísticas & utilidades ================= */
-
-// Proxies / escáneres conocidos
+// -------------------- Utilidades & Heurísticas --------------------
 function looksLikeProxyUA(ua = '') {
   const s = ua.toLowerCase();
   return /(googleimageproxy|google proxy|mpp|apple|icloud|outlook-httpproxy|outlookimgcache|microsoft-httpproxy|office365-httpproxy|proofpoint|mimecast|barracuda|trendmicro|symantec|sophos)/i.test(s);
 }
 function looksLikeProxyIP(ip = '') {
-  const s = String(ip).toLowerCase();
+  const s = String(ip || '').toLowerCase();
   return /(google|microsoft|outlook|office|icloud|apple|yahoo|aol|proofpoint|mimecast)/i.test(s);
 }
-
-// Human UA (navegadores y Outlook reales)
 function looksLikeHumanUA(ua = '') {
   const s = ua.toLowerCase();
   return (
-    /(iphone|ipad|android|windows nt|macintosh|linux).*?(chrome|safari|firefox|edge)/i.test(s) ||   // navegadores reales
-    /(microsoft outlook|ms-office|office|msie|trident\/\d+\.\d+)/i.test(s) ||                      // Outlook desktop/MSHTML
-    /(mozilla\/5\.0).*?(windows nt|macintosh).*?(outlook)/i.test(s)                                // Outlook web en navegador
+    /(iphone|ipad|android|windows nt|macintosh|linux).*?(chrome|safari|firefox|edge)/i.test(s) ||
+    /(microsoft outlook|ms-office|office|msie|trident\/\d+\.\d+)/i.test(s) ||
+    /(mozilla\/5\.0).*?(windows nt|macintosh).*?(outlook)/i.test(s)
   );
 }
-
 function sameDay(a, b) {
   if (!a || !b) return false;
   const A = new Date(a), B = new Date(b);
   return A.toDateString() === B.toDateString();
 }
 
-// --- Extracción robusta de UA/IP desde el payload (parche A) ---
+// Extracción robusta (parche A)
 function extractUA(payload, reqHeaders) {
   return (
     payload?.user_agent ||
@@ -59,9 +62,9 @@ function extractUA(payload, reqHeaders) {
     payload?.context?.userAgent ||
     payload?.open?.user_agent ||
     payload?.headers?.['User-Agent'] ||
-    reqHeaders['x-sl-user-agent'] ||   // posible header propio
+    reqHeaders['x-sl-user-agent'] ||
     reqHeaders['x-user-agent'] ||
-    reqHeaders['user-agent'] ||        // fallback (axios/...)
+    reqHeaders['user-agent'] || // axios si viene del webhook
     ''
   );
 }
@@ -77,11 +80,10 @@ function extractIP(payload, reqHeaders, reqIp) {
   ).toString();
 }
 
-/* ================= Keep-alive ================= */
+// Keep-alive
 setInterval(() => console.log('🌀 Keep-alive ping cada 25 segundos'), 25 * 1000);
 
-/* ================= Rutas de lectura (sin cambios) ================= */
-
+// -------------------------- Rutas lectura --------------------------
 app.get('/', (_req, res) => res.send('✅ API funcionando correctamente'));
 
 app.get('/leads', async (_req, res) => {
@@ -120,15 +122,14 @@ app.get('/leads/:email', async (req, res) => {
   }
 });
 
-/* ================= Webhook (MISMA ruta /webhook) ================= */
-
+// --------------------------- Webhook v2 ----------------------------
 app.post('/webhook', async (req, res) => {
   const data = req.body;
 
-  // Normalización de campos del evento
+  // Normalización
   const rawType = (data.event_type || data.eventType || data.event || '').toLowerCase();
-  const email = data.email || data.to_email || data.recipient;
-  const ts = data.timestamp || data.time_sent || data.event_timestamp || data.occurred_at || new Date().toISOString();
+  const email   = data.email || data.to_email || data.recipient;
+  const ts      = data.timestamp || data.time_sent || data.event_timestamp || data.occurred_at || new Date().toISOString();
   const eventAt = new Date(ts);
 
   if (!rawType || !email || !ts) {
@@ -137,33 +138,32 @@ app.post('/webhook', async (req, res) => {
   }
 
   const event_type =
-    /open/.test(rawType)  ? 'email_open'  :
-    /click/.test(rawType) ? 'email_click' :
+    /open/.test(rawType)   ? 'email_open'  :
+    /click/.test(rawType)  ? 'email_click' :
     /reply|respond/.test(rawType) ? 'email_reply' :
     /sent|delivered/.test(rawType) ? 'email_sent' :
     rawType;
 
-  // UA/IP desde el payload si existen (si no, headers)
   const ua = extractUA(data, req.headers);
   const ip = extractIP(data, req.headers, req.ip);
 
-  // Debug opcional de estructura de payload (activar con DEBUG_UA=1)
+  // Debug estructura (opcional)
   if (event_type === 'email_open' && process.env.DEBUG_UA === '1') {
     try {
       const sample = {
         keys: Object.keys(data || {}),
         nested: {
-          client: data?.client ? Object.keys(data.client) : null,
-          device: data?.device ? Object.keys(data.device) : null,
-          open:   data?.open   ? Object.keys(data.open)   : null,
-          headers:data?.headers? Object.keys(data.headers): null,
+          client:  data?.client  ? Object.keys(data.client)  : null,
+          device:  data?.device  ? Object.keys(data.device)  : null,
+          open:    data?.open    ? Object.keys(data.open)    : null,
+          headers: data?.headers ? Object.keys(data.headers) : null,
         }
       };
       console.log('🧪 UA debug sample:', JSON.stringify(sample).slice(0, 900));
     } catch {}
   }
 
-  // Idempotencia simple
+  // Idempotencia
   const eventId = data.event_id || data.id || `${email}-${event_type}-${eventAt.getTime()}`;
   try {
     await pool.query(
@@ -192,7 +192,7 @@ app.post('/webhook', async (req, res) => {
     }
     const lead = r.rows[0];
 
-    // Heurística prudente
+    // Heurística
     const uaIsProxy = looksLikeProxyUA(ua);
     const ipIsProxy = looksLikeProxyIP(ip);
     const uaIsHuman = looksLikeHumanUA(ua);
@@ -200,20 +200,17 @@ app.post('/webhook', async (req, res) => {
     const lastSentV2 = lead.last_sent_v2 ? new Date(lead.last_sent_v2) : null;
     const lastOpenV2 = lead.last_open_v2 ? new Date(lead.last_open_v2) : null;
     const secondsSinceSend = lastSentV2 ? (eventAt - lastSentV2) / 1000 : null;
-    const tooFast = secondsSinceSend !== null && secondsSinceSend < 12; // apoyo; nunca criterio único
+    const tooFast = secondsSinceSend !== null && secondsSinceSend < 12; // apoyo
     const sameDayDup = sameDay(lastOpenV2, eventAt);
 
-    // Solo sospechoso si huele a proxy; el tiempo solo refuerza si hay proxy.
-    const suspiciousOpen =
-      event_type === 'email_open' &&
-      (uaIsProxy || ipIsProxy || (tooFast && (uaIsProxy || ipIsProxy)));
-
-    // UPDATE (solo columnas v2; v1 intactas)
+    // v2 NO SE DUPLICA:
+    // - Por webhook solo cuenta v2 si UA es humano y no-proxy
+    // - Si es proxy, va a suspicious_open_count
     let updates = [];
     let values = [email];
     let i = 2;
     let newScore = lead.score_v2 || 0;
-    let segment = lead.segment_v2 || 'zombie';
+    let segment  = lead.segment_v2 || 'zombie';
 
     if (event_type === 'email_sent') {
       updates.push(`send_count_v2 = COALESCE(send_count_v2,0) + 1`);
@@ -223,17 +220,14 @@ app.post('/webhook', async (req, res) => {
     if (event_type === 'email_open') {
       updates.push(`last_open_v2 = $${i++}`); values.push(eventAt);
 
-      if (suspiciousOpen) {
-        updates.push(`suspicious_open_count = COALESCE(suspicious_open_count,0) + 1`);
-      } else {
-        // Apertura humana o al menos no-proxy. Evita duplicar el mismo día.
+      if (uaIsHuman && !uaIsProxy) {
         if (!sameDayDup) {
           updates.push(`open_count_v2 = COALESCE(open_count_v2,0) + 1`);
-          if (uaIsHuman && !uaIsProxy) {
-            updates.push(`human_open_count = COALESCE(human_open_count,0) + 1`);
-          }
+          updates.push(`human_open_count = COALESCE(human_open_count,0) + 1`);
           newScore += 1;
         }
+      } else if (uaIsProxy || ipIsProxy || (tooFast && (uaIsProxy || ipIsProxy))) {
+        updates.push(`suspicious_open_count = COALESCE(suspicious_open_count,0) + 1`);
       }
 
       // Auditoría (no bloqueante)
@@ -241,7 +235,7 @@ app.post('/webhook', async (req, res) => {
         await pool.query(
           `INSERT INTO lead_open_events_v2 (email, opened_at, user_agent, ip, is_suspicious)
            VALUES ($1,$2,$3,$4,$5)`,
-          [email, eventAt, ua, ip, !!suspiciousOpen]
+          [email, eventAt, ua, ip, !!(uaIsProxy || ipIsProxy)]
         );
       } catch (_) {}
     }
@@ -263,7 +257,7 @@ app.post('/webhook', async (req, res) => {
       (lead.reply_count_v2 > 0 || event_type === 'email_reply') ||
       (lead.click_count_v2 > 0 || event_type === 'email_click') ||
       (
-        ((lead.human_open_count || 0) + ((event_type === 'email_open' && !suspiciousOpen && !sameDayDup && uaIsHuman && !uaIsProxy) ? 1 : 0)) >= 2
+        ((lead.human_open_count || 0) + ((event_type === 'email_open' && uaIsHuman && !uaIsProxy && !sameDayDup) ? 1 : 0)) >= 2
       );
 
     if (humanSignals && newScore >= 12)      segment = 'vip';
@@ -281,7 +275,7 @@ app.post('/webhook', async (req, res) => {
 
     const label =
       event_type === 'email_open'
-        ? (suspiciousOpen ? '🤖 sospechoso' : (uaIsHuman ? '🧑 humano' : 'no-proxy'))
+        ? ((uaIsHuman && !uaIsProxy) ? '🧑 humano' : (uaIsProxy ? '🤖 sospechoso' : 'no-proxy'))
         : event_type;
 
     console.log(`v2 ✅ ${email} → ${segment} (score_v2 ${newScore}) | ${event_type === 'email_open' ? `open ${label}${sameDayDup ? ' (dup día)' : ''}` : event_type}`);
@@ -292,7 +286,7 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-/* ================= Píxel propio 1×1 ================= */
+// ------------------------- Píxel /o.gif ---------------------------
 // /o.gif?e=<email>&m=<message_id_opcional>
 app.get('/o.gif', async (req, res) => {
   try {
@@ -317,7 +311,7 @@ app.get('/o.gif', async (req, res) => {
     const lastOpenV2 = lead.last_open_v2 ? new Date(lead.last_open_v2) : null;
     const sameDayDup = lastOpenV2 && (lastOpenV2.toDateString() === now.toDateString());
 
-    // UA/IP REALES del lector (no del webhook)
+    // UA/IP reales del cliente
     const ua = req.headers['user-agent'] || '';
     const ip = (req.headers['x-real-ip'] || req.headers['x-forwarded-for'] || req.ip || '').toString();
 
@@ -332,7 +326,7 @@ app.get('/o.gif', async (req, res) => {
 
     if (rowCount > 0) {
       let updates = [];
-      let values = [email];
+      let values  = [email];
       let i = 2;
       let newScore = lead.score_v2 || 0;
 
@@ -372,13 +366,12 @@ app.get('/o.gif', async (req, res) => {
     res.setHeader('Expires', '0');
     res.status(200).end(gif1x1, 'binary');
   } catch (e) {
-    // Nunca romper la carga de imágenes del cliente
+    // Nunca romper la carga de imágenes
     res.status(200).end();
   }
 });
 
-/* ================= Start ================= */
-
+// ----------------------------- Start ------------------------------
 app.listen(port, async () => {
   console.log(`🚀 API corriendo en puerto ${port}`);
   try {
