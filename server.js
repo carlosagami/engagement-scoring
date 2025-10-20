@@ -48,7 +48,7 @@ function sameDay(a, b) {
   return A.toDateString() === B.toDateString();
 }
 
-// --- Parche A: extracción robusta de UA/IP desde el payload ---
+// --- Extracción robusta de UA/IP desde el payload (parche A) ---
 function extractUA(payload, reqHeaders) {
   return (
     payload?.user_agent ||
@@ -143,11 +143,11 @@ app.post('/webhook', async (req, res) => {
     /sent|delivered/.test(rawType) ? 'email_sent' :
     rawType;
 
-  // Parche A: tomar UA/IP del payload si existen (si no, caer a headers)
+  // UA/IP desde el payload si existen (si no, headers)
   const ua = extractUA(data, req.headers);
   const ip = extractIP(data, req.headers, req.ip);
 
-  // Debug opcional para mapear campos del payload (activar con DEBUG_UA=1)
+  // Debug opcional de estructura de payload (activar con DEBUG_UA=1)
   if (event_type === 'email_open' && process.env.DEBUG_UA === '1') {
     try {
       const sample = {
@@ -289,6 +289,91 @@ app.post('/webhook', async (req, res) => {
   } catch (err) {
     console.error('❌ Error al procesar webhook v2:', err.message);
     res.status(500).send('Error interno');
+  }
+});
+
+/* ================= Píxel propio 1×1 ================= */
+// /o.gif?e=<email>&m=<message_id_opcional>
+app.get('/o.gif', async (req, res) => {
+  try {
+    const email = (req.query.e || '').toString().trim().toLowerCase();
+    const mid   = (req.query.m || '').toString().trim();
+    if (!email) { res.status(400).end(); return; }
+
+    // Asegurar lead
+    let r = await pool.query('SELECT * FROM leads WHERE email = $1', [email]);
+    if (!r.rows[0]) {
+      await pool.query(
+        `INSERT INTO leads (email, send_count_v2, open_count_v2, human_open_count, suspicious_open_count,
+                            click_count_v2, reply_count_v2, score_v2, segment_v2)
+         VALUES ($1,0,0,0,0,0,0,0,'zombie')`,
+        [email]
+      );
+      r = await pool.query('SELECT * FROM leads WHERE email = $1', [email]);
+    }
+    const lead = r.rows[0];
+
+    const now = new Date();
+    const lastOpenV2 = lead.last_open_v2 ? new Date(lead.last_open_v2) : null;
+    const sameDayDup = lastOpenV2 && (lastOpenV2.toDateString() === now.toDateString());
+
+    // UA/IP REALES del lector (no del webhook)
+    const ua = req.headers['user-agent'] || '';
+    const ip = (req.headers['x-real-ip'] || req.headers['x-forwarded-for'] || req.ip || '').toString();
+
+    // Idempotencia por pixel
+    const eventId = `pixel-${email}-${mid || now.getTime()}`;
+    await pool.query(
+      `INSERT INTO lead_events_dedup (event_id, email, event_type)
+       VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`,
+      [eventId, email, 'email_open_pixel']
+    );
+    const { rowCount } = await pool.query('SELECT 1 FROM lead_events_dedup WHERE event_id = $1', [eventId]);
+
+    if (rowCount > 0) {
+      let updates = [];
+      let values = [email];
+      let i = 2;
+      let newScore = lead.score_v2 || 0;
+
+      updates.push(`last_open_v2 = $${i++}`); values.push(now);
+      if (!sameDayDup) {
+        updates.push(`open_count_v2 = COALESCE(open_count_v2,0) + 1`);
+        updates.push(`human_open_count = COALESCE(human_open_count,0) + 1`);
+        newScore += 1;
+      }
+      updates.push(`score_v2 = $${i++}`); values.push(newScore);
+
+      // Segmentación rápida
+      let segment = lead.segment_v2 || 'zombie';
+      const humanOpens = (lead.human_open_count || 0) + (sameDayDup ? 0 : 1);
+      if (newScore >= 12 && humanOpens >= 2) segment = 'vip';
+      else if (newScore >= 6)                segment = 'activo';
+      else if (newScore >= 2)                segment = 'dormido';
+      updates.push(`segment_v2 = $${i++}`);  values.push(segment);
+
+      const sql = `UPDATE leads SET ${updates.join(', ')} WHERE email = $1`;
+      await pool.query(sql, values);
+
+      await pool.query(
+        `INSERT INTO lead_open_events_v2 (email, opened_at, user_agent, ip, is_suspicious)
+         VALUES ($1,$2,$3,$4,$5)`,
+        [email, now, ua, ip, false]
+      );
+
+      console.log(`v2 ✅ ${email} → ${segment} (score_v2 ${newScore}) | open 🧑 humano (pixel)${sameDayDup ? ' (dup día)' : ''}`);
+    }
+
+    // GIF 1×1 transparente (sin caché)
+    const gif1x1 = Buffer.from('47494638396101000100800000ffffff00000021f90401000001002c00000000010001000002024401003b','hex');
+    res.setHeader('Content-Type', 'image/gif');
+    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+    res.status(200).end(gif1x1, 'binary');
+  } catch (e) {
+    // Nunca romper la carga de imágenes del cliente
+    res.status(200).end();
   }
 });
 
