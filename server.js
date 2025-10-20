@@ -1,16 +1,16 @@
-// ======================= ESP Server (final) =======================
-// - Webhook /webhook (Smartlead): en v2 SOLO suma si el UA es humano
-// - Píxel /o.gif: registra SIEMPRE apertura humana real (UA/IP del lector)
+// ======================= ESP Server (FINAL) =======================
+// - Webhook /webhook (Smartlead): métricas v2 SOLO si UA humano (no-proxy)
+// - Píxel /o.gif: cuenta UNA apertura por MENSAJE (usa ?m=); fallback si falta la col. message_base
+// - Auditoría: lead_open_events_v2 (con user_agent/ip/is_suspicious y message_base cuando exista)
 // - Rutas lectura: /, /leads, /leads.csv, /leads/:email
 // - Idempotencia con lead_events_dedup
-// - Almacén de auditoría en lead_open_events_v2
 // ================================================================
 
-const express   = require('express');
-const { Pool }  = require('pg');
-const dotenv    = require('dotenv');
-const bodyParser= require('body-parser');
-const { Parser }= require('json2csv');
+const express    = require('express');
+const { Pool }   = require('pg');
+const dotenv     = require('dotenv');
+const bodyParser = require('body-parser');
+const { Parser } = require('json2csv');
 
 dotenv.config();
 
@@ -147,22 +147,6 @@ app.post('/webhook', async (req, res) => {
   const ua = extractUA(data, req.headers);
   const ip = extractIP(data, req.headers, req.ip);
 
-  // Debug estructura (opcional)
-  if (event_type === 'email_open' && process.env.DEBUG_UA === '1') {
-    try {
-      const sample = {
-        keys: Object.keys(data || {}),
-        nested: {
-          client:  data?.client  ? Object.keys(data.client)  : null,
-          device:  data?.device  ? Object.keys(data.device)  : null,
-          open:    data?.open    ? Object.keys(data.open)    : null,
-          headers: data?.headers ? Object.keys(data.headers) : null,
-        }
-      };
-      console.log('🧪 UA debug sample:', JSON.stringify(sample).slice(0, 900));
-    } catch {}
-  }
-
   // Idempotencia
   const eventId = data.event_id || data.id || `${email}-${event_type}-${eventAt.getTime()}`;
   try {
@@ -203,9 +187,7 @@ app.post('/webhook', async (req, res) => {
     const tooFast = secondsSinceSend !== null && secondsSinceSend < 12; // apoyo
     const sameDayDup = sameDay(lastOpenV2, eventAt);
 
-    // v2 NO SE DUPLICA:
-    // - Por webhook solo cuenta v2 si UA es humano y no-proxy
-    // - Si es proxy, va a suspicious_open_count
+    // v2 NO SE DUPLICA: por webhook solo si UA humano no-proxy
     let updates = [];
     let values = [email];
     let i = 2;
@@ -252,13 +234,11 @@ app.post('/webhook', async (req, res) => {
       newScore += 10;
     }
 
-    // Segmentación v2 (VIP exige señales humanas)
+    // Segmentación v2
     const humanSignals =
       (lead.reply_count_v2 > 0 || event_type === 'email_reply') ||
       (lead.click_count_v2 > 0 || event_type === 'email_click') ||
-      (
-        ((lead.human_open_count || 0) + ((event_type === 'email_open' && uaIsHuman && !uaIsProxy && !sameDayDup) ? 1 : 0)) >= 2
-      );
+      ( ((lead.human_open_count || 0) + ((event_type === 'email_open' && uaIsHuman && !uaIsProxy && !sameDayDup) ? 1 : 0)) >= 2 );
 
     if (humanSignals && newScore >= 12)      segment = 'vip';
     else if (newScore >= 6)                  segment = 'activo';
@@ -278,7 +258,7 @@ app.post('/webhook', async (req, res) => {
         ? ((uaIsHuman && !uaIsProxy) ? '🧑 humano' : (uaIsProxy ? '🤖 sospechoso' : 'no-proxy'))
         : event_type;
 
-    console.log(`v2 ✅ ${email} → ${segment} (score_v2 ${newScore}) | ${event_type === 'email_open' ? `open ${label}${sameDayDup ? ' (dup día)' : ''}` : event_type}`);
+    console.log(`v2 ✅ ${email} → ${segment} (score_v2 ${newScore}) | ${event_type === 'email_open' ? `open ${label}` : event_type}`);
     res.send('OK');
   } catch (err) {
     console.error('❌ Error al procesar webhook v2:', err.message);
@@ -287,11 +267,11 @@ app.post('/webhook', async (req, res) => {
 });
 
 // ------------------------- Píxel /o.gif ---------------------------
-// /o.gif?e=<email>&m=<message_id_opcional>
+// /o.gif?e=<email>&m=<message_base_id>
 app.get('/o.gif', async (req, res) => {
   try {
     const email = (req.query.e || '').toString().trim().toLowerCase();
-    const mid   = (req.query.m || '').toString().trim();
+    const mid   = (req.query.m || '').toString().trim(); // baseId que manda el relay
     if (!email) { res.status(400).end(); return; }
 
     // Asegurar lead
@@ -308,15 +288,13 @@ app.get('/o.gif', async (req, res) => {
     const lead = r.rows[0];
 
     const now = new Date();
-    const lastOpenV2 = lead.last_open_v2 ? new Date(lead.last_open_v2) : null;
-    const sameDayDup = lastOpenV2 && (lastOpenV2.toDateString() === now.toDateString());
 
-    // UA/IP reales del cliente
+    // UA/IP REALES del cliente
     const ua = req.headers['user-agent'] || '';
     const ip = (req.headers['x-real-ip'] || req.headers['x-forwarded-for'] || req.ip || '').toString();
 
-    // Idempotencia por pixel
-    const eventId = `pixel-${email}-${mid || now.getTime()}`;
+    // Idempotencia por mensaje (si hay mid) o por timestamp (fallback)
+    const eventId = mid ? `pixel-${email}-${mid}` : `pixel-${email}-${now.getTime()}`;
     await pool.query(
       `INSERT INTO lead_events_dedup (event_id, email, event_type)
        VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`,
@@ -331,16 +309,16 @@ app.get('/o.gif', async (req, res) => {
       let newScore = lead.score_v2 || 0;
 
       updates.push(`last_open_v2 = $${i++}`); values.push(now);
-      if (!sameDayDup) {
-        updates.push(`open_count_v2 = COALESCE(open_count_v2,0) + 1`);
-        updates.push(`human_open_count = COALESCE(human_open_count,0) + 1`);
-        newScore += 1;
-      }
+      // ✅ Contar una sola vez por MENSAJE (si mid) o por invocación (sin mid)
+      updates.push(`open_count_v2 = COALESCE(open_count_v2,0) + 1`);
+      updates.push(`human_open_count = COALESCE(human_open_count,0) + 1`);
+      newScore += 1;
+
       updates.push(`score_v2 = $${i++}`); values.push(newScore);
 
       // Segmentación rápida
       let segment = lead.segment_v2 || 'zombie';
-      const humanOpens = (lead.human_open_count || 0) + (sameDayDup ? 0 : 1);
+      const humanOpens = (lead.human_open_count || 0) + 1;
       if (newScore >= 12 && humanOpens >= 2) segment = 'vip';
       else if (newScore >= 6)                segment = 'activo';
       else if (newScore >= 2)                segment = 'dormido';
@@ -349,13 +327,23 @@ app.get('/o.gif', async (req, res) => {
       const sql = `UPDATE leads SET ${updates.join(', ')} WHERE email = $1`;
       await pool.query(sql, values);
 
-      await pool.query(
-        `INSERT INTO lead_open_events_v2 (email, opened_at, user_agent, ip, is_suspicious)
-         VALUES ($1,$2,$3,$4,$5)`,
-        [email, now, ua, ip, false]
-      );
+      // Auditoría: intenta con message_base; si falla, inserta sin esa columna (fallback)
+      try {
+        await pool.query(
+          `INSERT INTO lead_open_events_v2 (email, opened_at, user_agent, ip, is_suspicious, message_base)
+           VALUES ($1,$2,$3,$4,$5,$6)`,
+          [email, now, ua, ip, false, (mid || null)]
+        );
+      } catch (e) {
+        // Fallback para esquemas sin message_base
+        await pool.query(
+          `INSERT INTO lead_open_events_v2 (email, opened_at, user_agent, ip, is_suspicious)
+           VALUES ($1,$2,$3,$4,$5)`,
+          [email, now, ua, ip, false]
+        );
+      }
 
-      console.log(`v2 ✅ ${email} → ${segment} (score_v2 ${newScore}) | open 🧑 humano (pixel)${sameDayDup ? ' (dup día)' : ''}`);
+      console.log(`v2 ✅ ${email} → ${segment} (score_v2 ${newScore}) | open 🧑 humano (pixel${mid ? ' msg' : ' no-mid'})`);
     }
 
     // GIF 1×1 transparente (sin caché)
