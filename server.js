@@ -20,31 +20,25 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
-/* ================= Helpers anti-falsos y utilidades ================= */
+/* ================= Heurísticas & utilidades ================= */
 
-// Proxies / escáneres conocidos (Gmail proxy, Apple MPP, gateways de seguridad, etc.)
+// Proxies / escáneres conocidos
 function looksLikeProxyUA(ua = '') {
   const s = ua.toLowerCase();
   return /(googleimageproxy|google proxy|mpp|apple|icloud|outlook-httpproxy|outlookimgcache|microsoft-httpproxy|office365-httpproxy|proofpoint|mimecast|barracuda|trendmicro|symantec|sophos)/i.test(s);
 }
 function looksLikeProxyIP(ip = '') {
   const s = String(ip).toLowerCase();
-  // Nota: esto es heurístico; lo fino viene de UA. Mantenemos por si headers traen hints.
   return /(google|microsoft|outlook|office|icloud|apple|yahoo|aol|proofpoint|mimecast)/i.test(s);
 }
 
-// Señales de **usuario real**: navegadores comunes y **Outlook real** (desktop/web) en Windows/macOS
+// Human UA (navegadores y Outlook reales)
 function looksLikeHumanUA(ua = '') {
   const s = ua.toLowerCase();
   return (
-    // Navegadores reales (desktop/móvil)
-    /(iphone|ipad|android|windows nt|macintosh|linux).*?(chrome|safari|firefox|edge)/i.test(s)
-    ||
-    // Outlook de escritorio y variantes MSHTML/Trident (Windows)
-    /(microsoft outlook|ms-office|office|msie|trident\/\d+\.\d+)/i.test(s)
-    ||
-    // Outlook Web App / O365 vía navegador (lleva mozilla/windows y "outlook")
-    /(mozilla\/5\.0).*?(windows nt|macintosh).*?(outlook)/i.test(s)
+    /(iphone|ipad|android|windows nt|macintosh|linux).*?(chrome|safari|firefox|edge)/i.test(s) ||   // navegadores reales
+    /(microsoft outlook|ms-office|office|msie|trident\/\d+\.\d+)/i.test(s) ||                      // Outlook desktop/MSHTML
+    /(mozilla\/5\.0).*?(windows nt|macintosh).*?(outlook)/i.test(s)                                // Outlook web en navegador
   );
 }
 
@@ -54,7 +48,36 @@ function sameDay(a, b) {
   return A.toDateString() === B.toDateString();
 }
 
-/* ================= Keep-alive log ================= */
+// --- Parche A: extracción robusta de UA/IP desde el payload ---
+function extractUA(payload, reqHeaders) {
+  return (
+    payload?.user_agent ||
+    payload?.ua ||
+    payload?.client?.user_agent ||
+    payload?.client?.ua ||
+    payload?.device?.user_agent ||
+    payload?.context?.userAgent ||
+    payload?.open?.user_agent ||
+    payload?.headers?.['User-Agent'] ||
+    reqHeaders['x-sl-user-agent'] ||   // posible header propio
+    reqHeaders['x-user-agent'] ||
+    reqHeaders['user-agent'] ||        // fallback (axios/...)
+    ''
+  );
+}
+function extractIP(payload, reqHeaders, reqIp) {
+  return (
+    payload?.ip ||
+    payload?.client?.ip ||
+    payload?.context?.ip ||
+    reqHeaders['x-real-ip'] ||
+    reqHeaders['x-forwarded-for'] ||
+    reqIp ||
+    ''
+  ).toString();
+}
+
+/* ================= Keep-alive ================= */
 setInterval(() => console.log('🌀 Keep-alive ping cada 25 segundos'), 25 * 1000);
 
 /* ================= Rutas de lectura (sin cambios) ================= */
@@ -102,7 +125,7 @@ app.get('/leads/:email', async (req, res) => {
 app.post('/webhook', async (req, res) => {
   const data = req.body;
 
-  // Normalización de campos
+  // Normalización de campos del evento
   const rawType = (data.event_type || data.eventType || data.event || '').toLowerCase();
   const email = data.email || data.to_email || data.recipient;
   const ts = data.timestamp || data.time_sent || data.event_timestamp || data.occurred_at || new Date().toISOString();
@@ -120,11 +143,27 @@ app.post('/webhook', async (req, res) => {
     /sent|delivered/.test(rawType) ? 'email_sent' :
     rawType;
 
-  // Red/UA para heurística
-  const ua = (data.user_agent || req.headers['user-agent'] || '');
-  const ip = (data.ip || req.headers['x-forwarded-for'] || req.ip || '').toString();
+  // Parche A: tomar UA/IP del payload si existen (si no, caer a headers)
+  const ua = extractUA(data, req.headers);
+  const ip = extractIP(data, req.headers, req.ip);
 
-  // Idempotencia
+  // Debug opcional para mapear campos del payload (activar con DEBUG_UA=1)
+  if (event_type === 'email_open' && process.env.DEBUG_UA === '1') {
+    try {
+      const sample = {
+        keys: Object.keys(data || {}),
+        nested: {
+          client: data?.client ? Object.keys(data.client) : null,
+          device: data?.device ? Object.keys(data.device) : null,
+          open:   data?.open   ? Object.keys(data.open)   : null,
+          headers:data?.headers? Object.keys(data.headers): null,
+        }
+      };
+      console.log('🧪 UA debug sample:', JSON.stringify(sample).slice(0, 900));
+    } catch {}
+  }
+
+  // Idempotencia simple
   const eventId = data.event_id || data.id || `${email}-${event_type}-${eventAt.getTime()}`;
   try {
     await pool.query(
@@ -153,7 +192,7 @@ app.post('/webhook', async (req, res) => {
     }
     const lead = r.rows[0];
 
-    // Heurística prudente (no penaliza aperturas humanas inmediatas)
+    // Heurística prudente
     const uaIsProxy = looksLikeProxyUA(ua);
     const ipIsProxy = looksLikeProxyIP(ip);
     const uaIsHuman = looksLikeHumanUA(ua);
@@ -164,7 +203,7 @@ app.post('/webhook', async (req, res) => {
     const tooFast = secondsSinceSend !== null && secondsSinceSend < 12; // apoyo; nunca criterio único
     const sameDayDup = sameDay(lastOpenV2, eventAt);
 
-    // Solo marcamos sospechoso si huele a proxy; el tiempo solo refuerza si hay proxy.
+    // Solo sospechoso si huele a proxy; el tiempo solo refuerza si hay proxy.
     const suspiciousOpen =
       event_type === 'email_open' &&
       (uaIsProxy || ipIsProxy || (tooFast && (uaIsProxy || ipIsProxy)));
@@ -182,16 +221,14 @@ app.post('/webhook', async (req, res) => {
     }
 
     if (event_type === 'email_open') {
-      // Trazabilidad de última apertura (si la columna es DATE, Postgres truncará la hora)
       updates.push(`last_open_v2 = $${i++}`); values.push(eventAt);
 
       if (suspiciousOpen) {
         updates.push(`suspicious_open_count = COALESCE(suspicious_open_count,0) + 1`);
       } else {
-        // Apertura humana o al menos no-proxy. Evita duplicar score el mismo día.
+        // Apertura humana o al menos no-proxy. Evita duplicar el mismo día.
         if (!sameDayDup) {
           updates.push(`open_count_v2 = COALESCE(open_count_v2,0) + 1`);
-          // Solo sumamos "human_open_count" cuando el UA parece humano (incluye Outlook real).
           if (uaIsHuman && !uaIsProxy) {
             updates.push(`human_open_count = COALESCE(human_open_count,0) + 1`);
           }
