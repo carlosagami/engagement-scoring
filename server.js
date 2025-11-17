@@ -1,4 +1,4 @@
-// ======================= ESP Server v4.2 (Engagement Scoring) =======================
+// ======================= ESP Server v5.0 (Engagement Scoring, Gmail+Outlook Focus) =======================
 // - Webhook /webhook (Smartlead):
 //     * sent/click/reply actualizan métricas y score_v2
 //     * open SOLO registra actividad; NO suma opens humanos ni score_v2
@@ -7,16 +7,17 @@
 //         - incrementa open_count_v2
 //         - incrementa human_open_count
 //         - suma puntos de score_v2 por open (máx 1 vez por mid)
-//     * Heurística:
-//         - tooFast => BOT
-//         - gateways/proxies de seguridad => BOT
-//         - Gmail Image Proxy / Apple MPP con delay => HUMANO
-//         - Outlook (desktop / web / mobile) con delay => HUMANO
-//         - Navegador/cliente humano sin proxy => HUMANO
-//         - TODO lo demás => BOT
-//     * lead_open_events_v2: UPDATE→INSERT (no depende de UNIQUE)
-//     * dedup de score por mid vía lead_events_dedup usando RETURNING
-// ================================================================================
+//     * Heurística ultra-conservadora:
+//         - Si no tenemos last_sent_v2 → BOT (no podemos confiar en el timing)
+//         - tooFast (<5s) → BOT
+//         - Gateways de seguridad (Proofpoint, Mimecast, etc.) → BOT
+//         - Gmail Image Proxy (ggpht / googleimageproxy) con delay → HUMANO
+//         - Apple MPP proxy con delay → HUMANO (opcional, lo dejamos activo)
+//         - Outlook (desktop/web/mobile, UA con “outlook/ms-office”) con delay → HUMANO
+//         - TODO LO DEMÁS → BOT
+//
+//     Resultado: métrica de opens MUY realista para Gmail y Outlook, sacrificando algo de cobertura
+// ========================================================================================================
 
 const express    = require('express');
 const { Pool }   = require('pg');
@@ -42,31 +43,36 @@ const pool = new Pool({
 
 // -------------------------- Constantes & Config --------------------------
 
-const PIXEL_MIN_SECONDS_HUMAN   = 5;   // <5s desde last_sent_v2 = sospechoso
-const OUTLOOK_MIN_SECONDS_HUMAN = 60;  // <60s desde envío → Outlook sospechoso
+const PIXEL_MIN_SECONDS_HUMAN   = 5;    // <5s desde last_sent_v2 = imposible humano
+const GMAIL_MIN_SECONDS_HUMAN   = 10;   // mínimo para confiar en GoogleImageProxy
+const APPLE_MIN_SECONDS_HUMAN   = 10;   // mínimo para Apple MPP
+const OUTLOOK_MIN_SECONDS_HUMAN = 45;   // <45s desde envío → Outlook sospechoso
 
 // -------------------- Utilidades & Heurísticas --------------------
 
-function looksLikeProxyUA(ua = '') {
+function looksLikeSecurityGatewayUA(ua = '') {
   const s = ua.toLowerCase();
-  return /googleimageproxy|google proxy|outlook-httpproxy|outlookimgcache|microsoft-httpproxy|office365-httpproxy|proofpoint|mimecast|barracuda|trendmicro|symantec|sophos/.test(s);
+  return /(proofpoint|mimecast|barracuda|trendmicro|symantec|sophos)/.test(s);
 }
 
-function looksLikeProxyIP(ip = '') {
+function looksLikeSecurityGatewayIP(ip = '') {
   const s = String(ip || '').toLowerCase();
-  return /(google|microsoft|outlook|office|icloud|apple mail|yahoo|aol|proofpoint|mimecast)/.test(s);
+  return /(proofpoint|mimecast|barracuda|trendmicro|symantec|sophos)/.test(s);
 }
 
-function looksLikeHumanUA(ua = '') {
+function isGmailProxyUA(ua = '') {
   const s = ua.toLowerCase();
-  return (
-    // Navegadores típicos
-    /(iphone|ipad|android|windows nt|macintosh|linux).*?(chrome|safari|firefox|edge)/i.test(s) ||
-    // Clientes de correo de escritorio
-    /(microsoft outlook|ms-office|outlook)/i.test(s) ||
-    // Fall-back outlook raro
-    /(mozilla\/5\.0).*?(windows nt|macintosh).*?(outlook)/i.test(s)
-  );
+  return /googleimageproxy|ggpht\.com/.test(s);
+}
+
+function isAppleMPPProxyUA(ua = '') {
+  const s = ua.toLowerCase();
+  return /(apple|icloud).*(proxy|mail|mpp)/.test(s);
+}
+
+function isOutlookUA(ua = '') {
+  const s = ua.toLowerCase();
+  return /(microsoft outlook|ms-office|outlook|outlook-android|outlook-ios)/.test(s);
 }
 
 function sameDay(a, b) {
@@ -120,28 +126,27 @@ function sendGif(res) {
 
 // ------------------ Clasificación del hit del píxel ------------------
 //
-// Orden de decisión:
-// 1) Demasiado rápido → BOT
-// 2) Gateways de seguridad → BOT
-// 3) Gmail proxy / Apple MPP → HUMANO (con delay)
-// 4) Outlook (desktop/web/mobile) sin proxy → HUMANO (con delay)
-// 5) UA humano sin proxy → HUMANO fuerte
-// 6) Resto → BOT
+// Solo consideramos HUMANO en 3 casos principales:
+//   - Gmail proxy después de cierto tiempo
+//   - Apple MPP después de cierto tiempo
+//   - Outlook después de cierto tiempo
+// TODO LO DEMÁS → BOT
 //
 function classifyPixelOpen({ ua, ip, secondsSinceSend }) {
   const uaLower = (ua || '').toLowerCase();
 
-  const isGoogleImageProxy = /googleimageproxy/.test(uaLower);
-  const isAppleMPP         = /(apple|icloud).*(proxy|mail|mpp)/.test(uaLower);
-  const isSecurityGateway  = /(proofpoint|mimecast|barracuda|trendmicro|symantec|sophos)/.test(uaLower);
-  const isProxyUA          = looksLikeProxyUA(ua);
-  const isProxyIP          = looksLikeProxyIP(ip);
+  // Si no tenemos referencia de envío, no confiamos en nada
+  if (secondsSinceSend === null || Number.isNaN(secondsSinceSend)) {
+    return {
+      isHuman: false,
+      isSuspicious: true,
+      secondsSinceSend,
+      reason: 'no_last_sent_v2'
+    };
+  }
 
-  // Outlook (cualquier variante razonable)
-  const isOutlookUA = /(microsoft outlook|ms-office|outlook|outlook-android|outlook-ios)/i.test(uaLower);
-
-  // 1) Demasiado rápido desde el envío => inhumano sí o sí
-  if (secondsSinceSend !== null && secondsSinceSend < PIXEL_MIN_SECONDS_HUMAN) {
+  // 1) Demasiado rápido desde el envío => imposible humano
+  if (secondsSinceSend < PIXEL_MIN_SECONDS_HUMAN) {
     return {
       isHuman: false,
       isSuspicious: true,
@@ -150,8 +155,11 @@ function classifyPixelOpen({ ua, ip, secondsSinceSend }) {
     };
   }
 
-  // 2) Gateways de seguridad claros
-  if (isSecurityGateway) {
+  const isSecurityUA = looksLikeSecurityGatewayUA(ua);
+  const isSecurityIP = looksLikeSecurityGatewayIP(ip);
+
+  // 2) Gateways de seguridad claros => BOT siempre
+  if (isSecurityUA || isSecurityIP) {
     return {
       isHuman: false,
       isSuspicious: true,
@@ -160,28 +168,49 @@ function classifyPixelOpen({ ua, ip, secondsSinceSend }) {
     };
   }
 
-  // 3) Gmail proxy / Apple MPP
-  if (isGoogleImageProxy || isAppleMPP) {
-    if (secondsSinceSend !== null && secondsSinceSend < (PIXEL_MIN_SECONDS_HUMAN + 2)) {
+  const gmailProxy  = isGmailProxyUA(uaLower);
+  const appleProxy  = isAppleMPPProxyUA(uaLower);
+  const outlookUA   = isOutlookUA(uaLower);
+
+  // 3) Gmail proxy (GoogleImageProxy / ggpht.com)
+  if (gmailProxy) {
+    if (secondsSinceSend < GMAIL_MIN_SECONDS_HUMAN) {
       return {
         isHuman: false,
         isSuspicious: true,
         secondsSinceSend,
-        reason: 'proxy_too_soon'
+        reason: `gmail_proxy_too_soon_${secondsSinceSend.toFixed(2)}s`
       };
     }
-
     return {
       isHuman: true,
       isSuspicious: false,
       secondsSinceSend,
-      reason: isGoogleImageProxy ? 'gmail_proxy_after_delay' : 'apple_mpp_after_delay'
+      reason: 'gmail_proxy_after_delay'
     };
   }
 
-  // 4) Outlook REAL (desktop/web/mobile) sin proxy
-  if (isOutlookUA && !isProxyUA && !isProxyIP) {
-    if (secondsSinceSend !== null && secondsSinceSend < OUTLOOK_MIN_SECONDS_HUMAN) {
+  // 4) Apple MPP (lo tratamos como humano probabilístico)
+  if (appleProxy) {
+    if (secondsSinceSend < APPLE_MIN_SECONDS_HUMAN) {
+      return {
+        isHuman: false,
+        isSuspicious: true,
+        secondsSinceSend,
+        reason: `apple_proxy_too_soon_${secondsSinceSend.toFixed(2)}s`
+      };
+    }
+    return {
+      isHuman: true,
+      isSuspicious: false,
+      secondsSinceSend,
+      reason: 'apple_mpp_after_delay'
+    };
+  }
+
+  // 5) Outlook REAL (desktop/web/mobile) → necesita delay mayor
+  if (outlookUA) {
+    if (secondsSinceSend < OUTLOOK_MIN_SECONDS_HUMAN) {
       return {
         isHuman: false,
         isSuspicious: true,
@@ -189,7 +218,6 @@ function classifyPixelOpen({ ua, ip, secondsSinceSend }) {
         reason: `outlook_too_soon_${secondsSinceSend.toFixed(2)}s`
       };
     }
-
     return {
       isHuman: true,
       isSuspicious: false,
@@ -198,18 +226,7 @@ function classifyPixelOpen({ ua, ip, secondsSinceSend }) {
     };
   }
 
-  // 5) UA humano “fuerte”: navegador/cliente típico, sin olor a proxy
-  const looksHuman = looksLikeHumanUA(ua);
-  if (looksHuman && !isProxyUA && !isProxyIP) {
-    return {
-      isHuman: true,
-      isSuspicious: false,
-      secondsSinceSend,
-      reason: 'humanUA_strict'
-    };
-  }
-
-  // 6) Todo lo demás => sospechoso / bot
+  // 6) Todo lo demás → BOT
   return {
     isHuman: false,
     isSuspicious: true,
@@ -223,7 +240,7 @@ setInterval(() => console.log('🌀 [SYS] keepalive'), 25 * 1000);
 
 // -------------------------- Rutas lectura --------------------------
 
-app.get('/', (_req, res) => res.send('✅ API Engagement v4.2 funcionando correctamente'));
+app.get('/', (_req, res) => res.send('✅ API Engagement v5.0 funcionando correctamente'));
 
 app.get('/leads', async (_req, res) => {
   try {
@@ -238,7 +255,7 @@ app.get('/leads', async (_req, res) => {
 app.get('/leads.csv', async (_req, res) => {
   try {
     const { rows } = await pool.query('SELECT * FROM leads ORDER BY email');
-  const parser = new Parser();
+    const parser = new Parser();
     const csv = parser.parse(rows);
     res.header('Content-Type', 'text/csv');
     res.attachment('leads.csv');
@@ -261,7 +278,9 @@ app.get('/leads/:email', async (req, res) => {
   }
 });
 
-// --------------------------- Webhook v4.2 ----------------------------
+// --------------------------- Webhook v5.0 ----------------------------
+// - sent/click/reply impactan score y segmento
+// - open solo registra actividad (NO suma opens ni score)
 
 app.post('/webhook', async (req, res) => {
   const data = req.body;
@@ -288,6 +307,7 @@ app.post('/webhook', async (req, res) => {
   const ua = extractUA(data, req.headers);
   const ip = extractIP(data, req.headers, req.ip);
 
+  // Idempotencia webhook vía event_id
   const eventId = data.event_id || data.id || `${email}-${event_type}-${eventAt.getTime()}`;
   try {
     const { rowCount } = await pool.query(
@@ -306,6 +326,7 @@ app.post('/webhook', async (req, res) => {
   }
 
   try {
+    // Asegurar lead
     let r = await pool.query('SELECT * FROM leads WHERE email = $1', [email]);
     if (!r.rows[0]) {
       await pool.query(
@@ -323,24 +344,24 @@ app.post('/webhook', async (req, res) => {
     const secondsSinceSend = lastSentV2 ? (eventAt - lastSentV2) / 1000 : null;
     const tooFast = secondsSinceSend !== null && secondsSinceSend < PIXEL_MIN_SECONDS_HUMAN;
 
-    const uaIsProxy = looksLikeProxyUA(ua);
-    const ipIsProxy = looksLikeProxyIP(ip);
-    const uaIsHuman = looksLikeHumanUA(ua);
-
     let updates = [];
     let values  = [email];
     let i       = 2;
     let newScore = lead.score_v2 || 0;
     let segment  = lead.segment_v2 || 'zombie';
 
+    // Sent
     if (event_type === 'email_sent') {
       updates.push(`send_count_v2 = COALESCE(send_count_v2,0) + 1`);
       updates.push(`last_sent_v2 = $${i++}`); values.push(eventAt);
     }
 
+    // Open (solo log, sin score)
     if (event_type === 'email_open') {
+      const uaIsSecurity = looksLikeSecurityGatewayUA(ua);
+      const ipIsSecurity = looksLikeSecurityGatewayIP(ip);
       const isSuspicious =
-        !uaIsHuman || uaIsProxy || ipIsProxy || tooFast;
+        uaIsSecurity || ipIsSecurity || tooFast;
 
       updates.push(`last_open_v2 = $${i++}`); values.push(eventAt);
 
@@ -355,18 +376,21 @@ app.post('/webhook', async (req, res) => {
       }
     }
 
+    // Click
     if (event_type === 'email_click') {
       updates.push(`last_click_v2 = $${i++}`); values.push(eventAt);
       updates.push(`click_count_v2 = COALESCE(click_count_v2,0) + 1`);
       newScore += 5;
     }
 
+    // Reply
     if (event_type === 'email_reply') {
       updates.push(`last_reply_v2 = $${i++}`); values.push(eventAt);
       updates.push(`reply_count_v2 = COALESCE(reply_count_v2,0) + 1`);
       newScore += 10;
     }
 
+    // Segmentación (solo con señales fuertes: clicks, replies, opens humanos del píxel)
     if (event_type === 'email_click' || event_type === 'email_reply') {
       const humanOpens = lead.human_open_count || 0;
       const humanSignals =
@@ -398,18 +422,20 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// ------------------------- Píxel /o.gif v4.2 ---------------------------
+// ------------------------- Píxel /o.gif v5.0 ---------------------------
+// /o.gif?e=<email>&m=<message_base_id>
 
 app.get('/o.gif', async (req, res) => {
   try {
     const email = (req.query.e || '').toString().trim().toLowerCase();
-    const mid   = (req.query.m || '').toString().trim();
+    const mid   = (req.query.m || '').toString().trim(); // message_base
 
     if (!email) {
       res.status(400).end();
       return;
     }
 
+    // Asegurar lead
     let r = await pool.query('SELECT * FROM leads WHERE email = $1', [email]);
     if (!r.rows[0]) {
       await pool.query(
@@ -437,7 +463,7 @@ app.get('/o.gif', async (req, res) => {
       secondsSinceSend
     });
 
-    // Registrar/actualizar evento de open SIN depender de UNIQUE
+    // Registrar/actualizar evento de open en lead_open_events_v2
     try {
       if (mid) {
         const upd = await pool.query(
@@ -469,6 +495,7 @@ app.get('/o.gif', async (req, res) => {
       console.warn('⚠️ [PIXEL][OPEN][WARN] al guardar open:', e.message);
     }
 
+    // Si NO es humano → solo sumamos sospechosos
     if (!isHuman) {
       try {
         await pool.query(
@@ -492,7 +519,7 @@ app.get('/o.gif', async (req, res) => {
       return;
     }
 
-    // HUMANO → dedup por mid
+    // HUMANO → deduplicar por mid (máx 1 vez por mensaje)
     let alreadyScored = false;
     if (mid) {
       try {
@@ -568,7 +595,7 @@ app.get('/o.gif', async (req, res) => {
 // ----------------------------- Start ------------------------------
 
 app.listen(port, async () => {
-  console.log('🚀 API Engagement v4.2 corriendo en puerto ' + port);
+  console.log('🚀 API Engagement v5.0 corriendo en puerto ' + port);
   try {
     await pool.query('SELECT NOW()');
     console.log('✅ [DB] Conexión exitosa a PostgreSQL');
