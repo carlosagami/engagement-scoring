@@ -1,4 +1,4 @@
-// ======================= ESP Server v3.9 (Engagement Scoring) =======================
+// ======================= ESP Server v4.0 (Engagement Scoring) =======================
 // - Webhook /webhook (Smartlead):
 //     * sent/click/reply actualizan métricas y score_v2
 //     * open SOLO registra actividad; NO suma opens humanos ni score_v2
@@ -7,11 +7,12 @@
 //         - incrementa open_count_v2
 //         - incrementa human_open_count
 //         - suma puntos de score_v2 por open (máx 1 vez por mid)
-//     * Heurística ultra conservadora:
+//     * Heurística:
 //         - tooFast => BOT
 //         - gateways/proxies de seguridad => BOT
-//         - SOLO Gmail Image Proxy / Apple MPP (con delay) => HUMANO
-//         - TODO lo demás => BOT (aunque parezca navegador real)
+//         - Gmail Image Proxy / Apple MPP con delay => HUMANO
+//         - Outlook real (no proxy) con delay => HUMANO
+//         - TODO lo demás => BOT
 //     * lead_open_events_v2: INSERT ... ON CONFLICT (email, message_base) DO UPDATE
 //     * dedup de score por mid vía lead_events_dedup usando RETURNING
 // ================================================================================
@@ -40,7 +41,8 @@ const pool = new Pool({
 
 // -------------------------- Constantes & Config --------------------------
 
-const PIXEL_MIN_SECONDS_HUMAN = 5;    // <5s desde last_sent_v2 = sospechoso
+const PIXEL_MIN_SECONDS_HUMAN   = 5;   // <5s desde last_sent_v2 = sospechoso
+const OUTLOOK_MIN_SECONDS_HUMAN = 60;  // <60s desde envío → no confiamos todavía en Outlook
 
 // -------------------- Utilidades & Heurísticas --------------------
 
@@ -67,7 +69,6 @@ function looksLikeHumanUA(ua = '') {
   );
 }
 
-// Extracción robusta para webhook (Smartlead / otros ESPs)
 function extractUA(payload, reqHeaders) {
   return (
     payload?.user_agent ||
@@ -111,16 +112,16 @@ function sendGif(res) {
   res.status(200).end(GIF_1X1, 'binary');
 }
 
-// Clasificación del hit del píxel (versión ultra conservadora)
+// Clasificación del hit del píxel (con Outlook incluido)
 function classifyPixelOpen({ ua, ip, secondsSinceSend }) {
   const uaLower = (ua || '').toLowerCase();
 
   const isGoogleImageProxy = /googleimageproxy/.test(uaLower);
   const isAppleMPP         = /(apple|icloud).*(proxy|mail|mpp)/.test(uaLower);
   const isSecurityGateway  = /(proofpoint|mimecast|barracuda|trendmicro|symantec|sophos)/.test(uaLower);
-
-  const isProxyUA  = looksLikeProxyUA(ua);
-  const isProxyIP  = looksLikeProxyIP(ip);
+  const isProxyUA          = looksLikeProxyUA(ua);
+  const isProxyIP          = looksLikeProxyIP(ip);
+  const isOutlookUA        = /(microsoft outlook|ms-office|outlook)/.test(uaLower);
 
   // 1) Demasiado rápido desde el envío => inhumano sí o sí
   if (secondsSinceSend !== null && secondsSinceSend < PIXEL_MIN_SECONDS_HUMAN) {
@@ -132,7 +133,7 @@ function classifyPixelOpen({ ua, ip, secondsSinceSend }) {
     };
   }
 
-  // 2) Gateways de seguridad claros (corporativos)
+  // 2) Gateways de seguridad claros
   if (isSecurityGateway) {
     return {
       isHuman: false,
@@ -142,7 +143,7 @@ function classifyPixelOpen({ ua, ip, secondsSinceSend }) {
     };
   }
 
-  // 3) Gmail proxy / Apple MPP → ÚNICAS señales que vamos a tratar como "humanas"
+  // 3) Gmail proxy / Apple MPP → señal fuerte de lectura
   if (isGoogleImageProxy || isAppleMPP) {
     if (secondsSinceSend !== null && secondsSinceSend < (PIXEL_MIN_SECONDS_HUMAN + 2)) {
       return {
@@ -161,9 +162,27 @@ function classifyPixelOpen({ ua, ip, secondsSinceSend }) {
     };
   }
 
-  // 4) Todo lo que no pase por proxy conocido → NO lo consideramos humano
-  //    aunque parezca navegador real.
-  if (isProxyUA || isProxyIP || looksLikeHumanUA(ua)) {
+  // 4) Outlook REAL (no proxy) con retraso razonable
+  if (isOutlookUA && !isProxyUA && !isProxyIP) {
+    if (secondsSinceSend !== null && secondsSinceSend < OUTLOOK_MIN_SECONDS_HUMAN) {
+      return {
+        isHuman: false,
+        isSuspicious: true,
+        secondsSinceSend,
+        reason: `outlook_too_soon_${secondsSinceSend.toFixed(2)}s`
+      };
+    }
+
+    return {
+      isHuman: true,
+      isSuspicious: false,
+      secondsSinceSend,
+      reason: 'outlook_after_delay'
+    };
+  }
+
+  // 5) Resto → sospechoso / bot
+  if (looksLikeHumanUA(ua) || isProxyUA || isProxyIP) {
     return {
       isHuman: false,
       isSuspicious: true,
@@ -172,7 +191,6 @@ function classifyPixelOpen({ ua, ip, secondsSinceSend }) {
     };
   }
 
-  // 5) Resto → también sospechoso
   return {
     isHuman: false,
     isSuspicious: true,
@@ -186,7 +204,7 @@ setInterval(() => console.log('🌀 [SYS] keepalive'), 25 * 1000);
 
 // -------------------------- Rutas lectura --------------------------
 
-app.get('/', (_req, res) => res.send('✅ API Engagement v3.9 funcionando correctamente'));
+app.get('/', (_req, res) => res.send('✅ API Engagement v4.0 funcionando correctamente'));
 
 app.get('/leads', async (_req, res) => {
   try {
@@ -224,7 +242,7 @@ app.get('/leads/:email', async (req, res) => {
   }
 });
 
-// --------------------------- Webhook v3.9 ----------------------------
+// --------------------------- Webhook v4.0 ----------------------------
 
 app.post('/webhook', async (req, res) => {
   const data = req.body;
@@ -368,7 +386,7 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// ------------------------- Píxel /o.gif v3.9 ---------------------------
+// ------------------------- Píxel /o.gif v4.0 ---------------------------
 
 app.get('/o.gif', async (req, res) => {
   try {
@@ -465,8 +483,6 @@ app.get('/o.gif', async (req, res) => {
            RETURNING 1`,
           [`pixel-score-${email}-${mid}`, email, 'email_open_pixel_score']
         );
-        // rowCount === 1  => primera vez que vemos este mid → NO estaba puntuado
-        // rowCount === 0  => ya existía → YA estaba puntuado antes
         if (rowCount === 0) {
           alreadyScored = true;
         }
@@ -530,7 +546,7 @@ app.get('/o.gif', async (req, res) => {
 // ----------------------------- Start ------------------------------
 
 app.listen(port, async () => {
-  console.log('🚀 API Engagement v3.9 corriendo en puerto ' + port);
+  console.log('🚀 API Engagement v4.0 corriendo en puerto ' + port);
   try {
     await pool.query('SELECT NOW()');
     console.log('✅ [DB] Conexión exitosa a PostgreSQL');
