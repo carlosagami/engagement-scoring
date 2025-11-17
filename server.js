@@ -1,12 +1,14 @@
-// ======================= ESP Server v3.2 (Engagement Scoring) =======================
+// ======================= ESP Server v3.3 (Engagement Scoring) =======================
 // - Webhook /webhook (Smartlead):
 //     * sent/click/reply actualizan métricas y score
-//     * open registra actividad, pero la FUENTE OFICIAL de opens para score es el píxel
+//     * open solo registra actividad; el score de opens viene del píxel
 // - Píxel /o.gif:
 //     * fuente principal y confiable de opens
-//     * heurística anti-bot (UA/IP/timing) más estricta:
-//         - primer hit sospechoso (tooFast / gateway / proxy)
-//         - segundo hit humano DESPUÉS (mismo mid) que SÍ suma score, si pasa filtros
+//     * heurística anti-bot (UA/IP/timing) estricta:
+//         - abre demasiado rápido => BOT
+//         - gateways/proxies “claros” => BOT
+//         - UA humano + no proxy => HUMANO FUERTE
+//         - Gmail/Apple proxy “después de un rato” => HUMANO PROBABILÍSTICO
 //     * lead_open_events_v2 se maneja con UPDATE→INSERT (no depende de UNIQUE)
 //     * dedup de score por mid vía lead_events_dedup (solo para score)
 // - Rutas lectura: /, /leads, /leads.csv, /leads/:email
@@ -114,13 +116,13 @@ function sendGif(res) {
   res.status(200).end(GIF_1X1, 'binary');
 }
 
-// Clasificación del hit del píxel con reglas estrictas:
-// - UA humano + no proxy (UA/IP) => humano fuerte
-// - Gmail proxy / Apple MPP => solo humanos si NO son inmediatos al envío
-// - Demasiado rápido => sospechoso siempre
+// Clasificación del hit del píxel:
+// - UA humano + no proxy (UA/IP)      => humano fuerte
+// - Gmail/Apple proxy tras cierto tiempo => humano probabilístico
+// - demasiado rápido                  => sospechoso siempre
+// - gateways (Proofpoint, Mimecast…)  => sospechoso
 function classifyPixelOpen({ ua, ip, secondsSinceSend }) {
   const uaLower = (ua || '').toLowerCase();
-  const ipLower = (ip || '').toLowerCase();
 
   const isGoogleImageProxy = /googleimageproxy/.test(uaLower);
   const isAppleMPP         = /(apple|icloud).*(proxy|mail|mpp)/.test(uaLower);
@@ -140,7 +142,7 @@ function classifyPixelOpen({ ua, ip, secondsSinceSend }) {
     };
   }
 
-  // 2) Gateways de seguridad claros (no nos interesa contarlos como humanos)
+  // 2) Gateways de seguridad claros
   if (isSecurityGateway) {
     return {
       isHuman: false,
@@ -152,7 +154,7 @@ function classifyPixelOpen({ ua, ip, secondsSinceSend }) {
 
   // 3) Gmail proxy / Apple MPP
   if (isGoogleImageProxy || isAppleMPP) {
-    // Si siguen pegados al envío (menos de unos segundos extra), no nos fiamos
+    // Si siguen pegados al envío, no nos fiamos
     if (secondsSinceSend !== null && secondsSinceSend < (PIXEL_MIN_SECONDS_HUMAN + 2)) {
       return {
         isHuman: false,
@@ -162,7 +164,7 @@ function classifyPixelOpen({ ua, ip, secondsSinceSend }) {
       };
     }
 
-    // Si ya pasó un rato razonable, los tratamos como "humano probabilístico"
+    // Si ya pasó un rato razonable, lo usamos como humano probabilístico
     return {
       isHuman: true,
       isSuspicious: false,
@@ -171,7 +173,7 @@ function classifyPixelOpen({ ua, ip, secondsSinceSend }) {
     };
   }
 
-  // 4) Humano "fuerte": UA humano y NO huele a proxy ni por UA ni por IP
+  // 4) Humano “fuerte”: UA humano y NO huele a proxy
   if (looksHuman && !isProxyUA && !isProxyIP) {
     return {
       isHuman: true,
@@ -181,7 +183,7 @@ function classifyPixelOpen({ ua, ip, secondsSinceSend }) {
     };
   }
 
-  // 5) Todo lo demás = sospechoso
+  // 5) Todo lo demás => sospechoso
   return {
     isHuman: false,
     isSuspicious: true,
@@ -191,18 +193,18 @@ function classifyPixelOpen({ ua, ip, secondsSinceSend }) {
 }
 
 // Keep-alive
-setInterval(() => console.log('🌀 Keep-alive ping cada 25 segundos'), 25 * 1000);
+setInterval(() => console.log('[SYS][KEEPALIVE] ping cada 25 segundos'), 25 * 1000);
 
 // -------------------------- Rutas lectura --------------------------
 
-app.get('/', (_req, res) => res.send('✅ API Engagement v3.2 funcionando correctamente'));
+app.get('/', (_req, res) => res.send('✅ API Engagement v3.3 funcionando correctamente'));
 
 app.get('/leads', async (_req, res) => {
   try {
     const { rows } = await pool.query('SELECT * FROM leads ORDER BY email');
     res.json(rows);
   } catch (err) {
-    console.error('❌ Error al obtener leads:', err.message);
+    console.error('[LEADS][ERROR] al obtener leads:', err.message);
     res.status(500).send('Error al obtener leads');
   }
 });
@@ -216,7 +218,7 @@ app.get('/leads.csv', async (_req, res) => {
     res.attachment('leads.csv');
     res.send(csv);
   } catch (err) {
-    console.error('❌ Error al generar CSV:', err.message);
+    console.error('[LEADS][CSV][ERROR] al generar CSV:', err.message);
     res.status(500).send('Error al generar CSV');
   }
 });
@@ -228,15 +230,14 @@ app.get('/leads/:email', async (req, res) => {
     if (rows.length === 0) return res.status(404).send('Lead no encontrado');
     res.json(rows[0]);
   } catch (err) {
-    console.error('❌ Error al obtener lead:', err.message);
+    console.error('[LEADS][DETAIL][ERROR] al obtener lead:', err.message);
     res.status(500).send('Error al obtener lead');
   }
 });
 
-// --------------------------- Webhook v3.2 ----------------------------
-// Webhook: NO suma opens al score.
-// - sent/click/reply: sí impactan score y segment
-// - open: registra actividad (last_open_v2 + lead_open_events_v2)
+// --------------------------- Webhook v3.3 ----------------------------
+// - sent/click/reply impactan score y segmento
+// - open solo registra actividad (no suma opens humanos; eso es del píxel)
 
 app.post('/webhook', async (req, res) => {
   const data = req.body;
@@ -246,15 +247,10 @@ app.post('/webhook', async (req, res) => {
   const ts      = data.timestamp || data.time_sent || data.event_timestamp || data.occurred_at || new Date().toISOString();
   const eventAt = new Date(ts);
 
-  // Log básico de depuración para entender qué viene del ESP
-  console.log('webhook IN =>', {
-    rawType,
-    email,
-    ts
-  });
+  console.log('[WEBHOOK][IN]', { rawType, email, ts });
 
   if (!rawType || !email || !ts) {
-    console.log('⚠️ Webhook ignorado por falta de datos clave:', { rawType, email, ts });
+    console.log('[WEBHOOK][SKIP] faltan datos clave', { rawType, email, ts });
     return res.status(400).send('Faltan datos clave');
   }
 
@@ -278,10 +274,11 @@ app.post('/webhook', async (req, res) => {
     );
     const { rowCount } = await pool.query('SELECT 1 FROM lead_events_dedup WHERE event_id = $1', [eventId]);
     if (rowCount === 0) {
+      console.log('[WEBHOOK][DEDUP] evento duplicado ignorado', { email, event_type, eventId });
       return res.status(200).send('Evento duplicado ignorado');
     }
   } catch (e) {
-    console.warn('⚠️ Dedup webhook no disponible, continuando:', e.message);
+    console.warn('[WEBHOOK][DEDUP][WARN]', e.message);
   }
 
   try {
@@ -295,7 +292,7 @@ app.post('/webhook', async (req, res) => {
         [email]
       );
       r = await pool.query('SELECT * FROM leads WHERE email = $1', [email]);
-      console.log('🆕 Nuevo lead creado (webhook):', email);
+      console.log('[WEBHOOK][NEW-LEAD]', email);
     }
     const lead = r.rows[0];
 
@@ -333,11 +330,11 @@ app.post('/webhook', async (req, res) => {
           [email, eventAt, ua, ip, isSuspicious]
         );
       } catch (e) {
-        console.warn('⚠️ Error guardando open (webhook):', e.message);
+        console.warn('[WEBHOOK][OPEN][WARN] al guardar open', e.message);
       }
     }
 
-    // Click (por ahora sin heurística anti-bot; lo afinamos después)
+    // Click (sin heurística anti-bot por ahora)
     if (event_type === 'email_click') {
       updates.push(`last_click_v2 = $${i++}`); values.push(eventAt);
       updates.push(`click_count_v2 = COALESCE(click_count_v2,0) + 1`);
@@ -351,7 +348,7 @@ app.post('/webhook', async (req, res) => {
       newScore += 10;
     }
 
-    // Segmentación basada en score + señales humanas (clicks/replies + opens humanos del píxel)
+    // Segmentación con score + señales humanas (clicks/replies + opens humanos del píxel)
     if (event_type === 'email_click' || event_type === 'email_reply') {
       const humanOpens = lead.human_open_count || 0;
       const humanSignals =
@@ -360,7 +357,7 @@ app.post('/webhook', async (req, res) => {
         (humanOpens >= 2);
 
       if (humanSignals && newScore >= 12)      segment = 'vip';
-      else if (newScore >= 6)                  segment = 'activo';
+      else if (humanSignals && newScore >= 6)  segment = 'activo';
       else if (newScore >= 2)                  segment = 'dormido';
       else                                     segment = 'zombie';
 
@@ -373,21 +370,23 @@ app.post('/webhook', async (req, res) => {
       await pool.query(sql, values);
     }
 
-    console.log(`webhook ✅ ${email} → ${segment} (score_v2 ${newScore}) | ${event_type}`);
+    console.log('[WEBHOOK][OK]', {
+      email,
+      type: event_type,
+      segment,
+      score_v2: newScore,
+      secondsSinceSend
+    });
+
     res.send('OK');
   } catch (err) {
-    console.error('❌ Error al procesar webhook v3.2:', err.message);
+    console.error('❌ [WEBHOOK][ERROR] procesando evento:', err.message);
     res.status(500).send('Error interno');
   }
 });
 
-// ------------------------- Píxel /o.gif v3.2 ---------------------------
+// ------------------------- Píxel /o.gif v3.3 ---------------------------
 // /o.gif?e=<email>&m=<message_base_id>
-//
-// - Clasifica cada hit (sospechoso / humano) usando timing + UA + proxy detection.
-// - Maneja lead_open_events_v2 con UPDATE→INSERT (email,message_base).
-// - Permite primer hit sospechoso y luego uno humano que SÍ sume score.
-// - Usa lead_events_dedup SOLO para dedup de score (event_id = pixel-score-...).
 
 app.get('/o.gif', async (req, res) => {
   try {
@@ -409,13 +408,13 @@ app.get('/o.gif', async (req, res) => {
         [email]
       );
       r = await pool.query('SELECT * FROM leads WHERE email = $1', [email]);
-      console.log('🆕 Nuevo lead creado (pixel):', email);
+      console.log('[PIXEL][NEW-LEAD]', email);
     }
     const lead = r.rows[0];
 
     const now = new Date();
 
-    // UA/IP reales del cliente (o del proxy/bot)
+    // UA/IP reales del cliente (o proxy/bot)
     const ua = req.headers['user-agent'] || '';
     const ip = (req.headers['x-real-ip'] || req.headers['x-forwarded-for'] || req.ip || '').toString();
 
@@ -431,7 +430,6 @@ app.get('/o.gif', async (req, res) => {
     // ----------------- Registrar/actualizar evento de open -----------------
     try {
       if (mid) {
-        // 1) Intentar actualizar si ya existe ese email+message_base
         const upd = await pool.query(
           `UPDATE lead_open_events_v2
            SET opened_at    = $3,
@@ -443,7 +441,6 @@ app.get('/o.gif', async (req, res) => {
           [email, mid, now, ua, ip, !!isSuspicious]
         );
 
-        // 2) Si no existía, insertar
         if (upd.rowCount === 0) {
           await pool.query(
             `INSERT INTO lead_open_events_v2 (email, message_base, opened_at, user_agent, ip, is_suspicious)
@@ -452,7 +449,6 @@ app.get('/o.gif', async (req, res) => {
           );
         }
       } else {
-        // Caso sin mid: insert simple
         await pool.query(
           `INSERT INTO lead_open_events_v2 (email, opened_at, user_agent, ip, is_suspicious)
            VALUES ($1,$2,$3,$4,$5)`,
@@ -460,7 +456,7 @@ app.get('/o.gif', async (req, res) => {
         );
       }
     } catch (e) {
-      console.warn('⚠️ Error guardando open (pixel):', e.message);
+      console.warn('[PIXEL][OPEN][WARN] al guardar open:', e.message);
     }
 
     // ----------------- Si NO es humano → solo contamos sospechoso -----------------
@@ -474,19 +470,24 @@ app.get('/o.gif', async (req, res) => {
           [email, now]
         );
       } catch (e) {
-        console.warn('⚠️ Error actualizando suspicious_open_count:', e.message);
+        console.warn('[PIXEL][SUSP][WARN] al actualizar suspicious_open_count:', e.message);
       }
 
-      console.log(
-        `pixel ⚠️ ${email} → ${lead.segment_v2} (score_v2 ${lead.score_v2}) | open 🤖 sospechoso (pixel${mid ? ' msg' : ' no-mid'}) | reason=${reason || ''}` +
-        (secondsSinceSend !== null ? ` | secsSinceSend=${secondsSinceSend.toFixed(2)}` : '') +
-        ` | ua="${ua}"`
-      );
+      console.log('[PIXEL][BOT]', {
+        email,
+        mid: mid || null,
+        segment: lead.segment_v2,
+        score_v2: lead.score_v2,
+        reason,
+        secondsSinceSend,
+        ua
+      });
+
       sendGif(res);
       return;
     }
 
-    // ----------------- Es humano → vemos si ya se puntuó ese mid -----------------
+    // ----------------- Es humano → ver si ya se puntuó ese mid -----------------
     let alreadyScored = false;
     if (mid) {
       const scoreEventId = `pixel-score-${email}-${mid}`;
@@ -498,10 +499,10 @@ app.get('/o.gif', async (req, res) => {
         );
         const { rowCount } = await pool.query('SELECT 1 FROM lead_events_dedup WHERE event_id = $1', [scoreEventId]);
         if (rowCount === 0) {
-          alreadyScored = true; // ya se puntuó antes este mid
+          alreadyScored = true;
         }
       } catch (e) {
-        console.warn('⚠️ Error en dedup de score (pixel):', e.message);
+        console.warn('[PIXEL][SCORE-DEDUP][WARN]', e.message);
       }
     }
 
@@ -514,18 +515,17 @@ app.get('/o.gif', async (req, res) => {
     let newScore = lead.score_v2 || 0;
     let segment  = lead.segment_v2 || 'zombie';
 
-    // Siempre actualizamos last_open_v2 con el último open humano
     updates.push(`last_open_v2 = $${i++}`); values.push(now);
 
-    // Solo sumamos open/human/score si:
-    // - no está marcado como ya puntuado para este mid
-    // - y no estamos dedupeando por día (si SAME_DAY_OPEN_DEDUP = true)
     let deltaHumanOpens = 0;
+    let scoredThisPixel = false;
+
     if (!alreadyScored && !isSameDay) {
       updates.push(`open_count_v2 = COALESCE(open_count_v2,0) + 1`);
       updates.push(`human_open_count = COALESCE(human_open_count,0) + 1`);
       newScore += 1;
       deltaHumanOpens = 1;
+      scoredThisPixel = true;
     }
 
     const futureHumanOpens =
@@ -537,7 +537,7 @@ app.get('/o.gif', async (req, res) => {
       (futureHumanOpens >= 2);
 
     if (humanSignals && newScore >= 12)      segment = 'vip';
-    else if (newScore >= 6)                  segment = 'activo';
+    else if (humanSignals && newScore >= 6)  segment = 'activo';
     else if (newScore >= 2)                  segment = 'dormido';
     else                                     segment = 'zombie';
 
@@ -547,15 +547,24 @@ app.get('/o.gif', async (req, res) => {
     const sql = `UPDATE leads SET ${updates.join(', ')} WHERE email = $1`;
     await pool.query(sql, values);
 
-    console.log(
-      `pixel ✅ ${email} → ${segment} (score_v2 ${newScore}) | open 🧑 humano (pixel${mid ? ' msg' : ' no-mid'}) | reason=${reason || ''}` +
-      (secondsSinceSend !== null ? ` | secsSinceSend=${secondsSinceSend.toFixed(2)}` : '') +
-      ` | ua="${ua}"`
-    );
+    console.log('[PIXEL][HUMAN]', {
+      email,
+      mid: mid || null,
+      reason,
+      secondsSinceSend,
+      ua,
+      scored: scoredThisPixel,
+      score_before: lead.score_v2,
+      score_after: newScore,
+      segment_before: lead.segment_v2,
+      segment_after: segment,
+      human_open_count_before: lead.human_open_count,
+      human_open_count_after: (lead.human_open_count || 0) + deltaHumanOpens
+    });
 
     sendGif(res);
   } catch (e) {
-    console.error('❌ Error en /o.gif v3.2:', e.message);
+    console.error('❌ [PIXEL][ERROR] en /o.gif:', e.message);
     sendGif(res);
   }
 });
@@ -563,11 +572,11 @@ app.get('/o.gif', async (req, res) => {
 // ----------------------------- Start ------------------------------
 
 app.listen(port, async () => {
-  console.log(`🚀 API Engagement v3.2 corriendo en puerto ${port}`);
+  console.log(`🚀 API Engagement v3.3 corriendo en puerto ${port}`);
   try {
     await pool.query('SELECT NOW()');
     console.log('✅ Conexión exitosa a PostgreSQL');
   } catch (err) {
-    console.error('❌ Error conectando a PostgreSQL:', err.message);
+    console.error('❌ [DB][ERROR] conectando a PostgreSQL:', err.message);
   }
 });
