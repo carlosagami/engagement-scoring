@@ -1,4 +1,4 @@
-// ======================= ESP Server v5.1 (Engagement Scoring, Gmail+Outlook Focus) =======================
+// ======================= ESP Server v5.2 (Engagement Scoring, Gmail+Outlook + Referer) =======================
 // - Webhook /webhook (Smartlead):
 //     * sent/click/reply actualizan métricas y score_v2
 //     * open SOLO registra actividad; NO suma opens humanos ni score_v2
@@ -14,7 +14,8 @@
 //         - Si NO hay last_sent_v2:
 //               - Si UA es Gmail proxy / Apple MPP / Outlook → HUMANO probabilístico
 //               - Si no → BOT (reason=no_last_sent_v2)
-// ========================================================================================================
+//     * Además, ahora logueamos REFERER en BOT y HUMAN para analizar Outlook web.
+// ============================================================================================================
 
 const express    = require('express');
 const { Pool }   = require('pg');
@@ -243,12 +244,12 @@ setInterval(() => console.log('🌀 [SYS] keepalive'), 25 * 1000);
 
 // -------------------------- Rutas lectura --------------------------
 
-app.get('/', (_req, res) => res.send('✅ API Engagement v5.1 funcionando correctamente'));
+app.get('/', (_req, res) => res.send('✅ API Engagement v5.2 funcionando correctamente'));
 
 app.get('/leads', async (_req, res) => {
   try {
     const { rows } = await pool.query('SELECT * FROM leads ORDER BY email');
-  res.json(rows);
+    res.json(rows);
   } catch (err) {
     console.error('⚠️ [LEADS][ERROR] al obtener leads:', err.message);
     res.status(500).send('Error al obtener leads');
@@ -281,7 +282,7 @@ app.get('/leads/:email', async (req, res) => {
   }
 });
 
-// --------------------------- Webhook v5.1 ----------------------------
+// --------------------------- Webhook v5.2 ----------------------------
 
 app.post('/webhook', async (req, res) => {
   const data = req.body;
@@ -416,12 +417,13 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// ------------------------- Píxel /o.gif v5.1 ---------------------------
+// ------------------------- Píxel /o.gif v5.2 ---------------------------
 
 app.get('/o.gif', async (req, res) => {
   try {
     const email = (req.query.e || '').toString().trim().toLowerCase();
     const mid   = (req.query.m || '').toString().trim();
+    const referer = req.headers['referer'] || req.headers['referrer'] || '';
 
     if (!email) {
       res.status(400).end();
@@ -455,6 +457,7 @@ app.get('/o.gif', async (req, res) => {
       secondsSinceSend
     });
 
+    // Guardar auditoría de open en lead_open_events_v2
     try {
       if (mid) {
         const upd = await pool.query(
@@ -499,10 +502,10 @@ app.get('/o.gif', async (req, res) => {
         console.warn('⚠️ [PIXEL][SUSP][WARN] al actualizar suspicious_open_count:', e.message);
       }
 
-      const secsStr = secondsSinceSend !== null ? ` secs=${secondsSinceSend.toFixed(2)}` : '';
+      const secsStr = secondsSinceSend !== null ? ` secs=${secondsSinceSend.toFixed(2)}` : ' secs=null';
       console.log(
         `🤖 [PIXEL][BOT] email=${email} mid=${mid || '-'} seg=${lead.segment_v2} score=${lead.score_v2}` +
-        ` reason=${reason || 'unknown'}${secsStr} ua="${ua}"`
+        ` reason=${reason || 'unknown'}${secsStr} ua="${ua}" referer="${referer}"`
       );
 
       sendGif(res);
@@ -566,13 +569,13 @@ app.get('/o.gif', async (req, res) => {
     const sql = `UPDATE leads SET ${updates.join(', ')} WHERE email = $1`;
     await pool.query(sql, values);
 
-    const secsStr = secondsSinceSend !== null ? ` secs=${secondsSinceSend.toFixed(2)}` : '';
+    const secsStr = secondsSinceSend !== null ? ` secs=${secondsSinceSend.toFixed(2)}` : ' secs=null';
     console.log(
       `👀 [PIXEL][HUMAN] email=${email} mid=${mid || '-'} reason=${reason || 'unknown'}` +
       ` scored=${scoredThisPixel} score=${lead.score_v2}->${newScore}` +
       ` seg=${lead.segment_v2}->${segment}` +
       ` opens=${lead.human_open_count || 0}->${(lead.human_open_count || 0) + deltaHumanOpens}` +
-      `${secsStr} ua="${ua}"`
+      `${secsStr} ua="${ua}" referer="${referer}"`
     );
 
     sendGif(res);
@@ -585,7 +588,7 @@ app.get('/o.gif', async (req, res) => {
 // ----------------------------- Start ------------------------------
 
 app.listen(port, async () => {
-  console.log('🚀 API Engagement v5.1 corriendo en puerto ' + port);
+  console.log('🚀 API Engagement v5.2 corriendo en puerto ' + port);
   try {
     await pool.query('SELECT NOW()');
     console.log('✅ [DB] Conexión exitosa a PostgreSQL');
