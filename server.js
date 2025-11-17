@@ -1,4 +1,4 @@
-// ======================= ESP Server v3.6 (Engagement Scoring) =======================
+// ======================= ESP Server v3.7 (Engagement Scoring) =======================
 // - Webhook /webhook (Smartlead):
 //     * sent/click/reply actualizan métricas y score
 //     * open SOLO registra actividad; NO suma opens humanos ni score
@@ -13,7 +13,7 @@
 //         - UA humano + no proxy => HUMANO FUERTE
 //         - Gmail/Apple proxy “después de un rato” => HUMANO PROBABILÍSTICO
 //     * lead_open_events_v2 con UPDATE→INSERT (no depende de UNIQUE)
-//     * dedup de score por mid vía lead_events_dedup (solo para score, ya SIN dedup por día)
+//     * dedup de score por mid vía lead_events_dedup (solo para score, SIN dedup por día)
 // ================================================================================
 
 const express    = require('express');
@@ -41,7 +41,6 @@ const pool = new Pool({
 // -------------------------- Constantes & Config --------------------------
 
 const PIXEL_MIN_SECONDS_HUMAN = 5;    // <5s desde last_sent_v2 = sospechoso
-// NOTA: ya NO usamos dedup por día; solo por mid
 
 // -------------------- Utilidades & Heurísticas --------------------
 
@@ -112,7 +111,7 @@ function sendGif(res) {
   res.status(200).end(GIF_1X1, 'binary');
 }
 
-// Clasificación del hit del píxel:
+// Clasificación del hit del píxel
 function classifyPixelOpen({ ua, ip, secondsSinceSend }) {
   const uaLower = (ua || '').toLowerCase();
 
@@ -183,18 +182,18 @@ function classifyPixelOpen({ ua, ip, secondsSinceSend }) {
 }
 
 // Keep-alive
-setInterval(() => console.log('[SYS][KEEPALIVE]'), 25 * 1000);
+setInterval(() => console.log('🌀 [SYS] keepalive'), 25 * 1000);
 
 // -------------------------- Rutas lectura --------------------------
 
-app.get('/', (_req, res) => res.send('✅ API Engagement v3.6 funcionando correctamente'));
+app.get('/', (_req, res) => res.send('✅ API Engagement v3.7 funcionando correctamente'));
 
 app.get('/leads', async (_req, res) => {
   try {
     const { rows } = await pool.query('SELECT * FROM leads ORDER BY email');
-  res.json(rows);
+    res.json(rows);
   } catch (err) {
-    console.error('[LEADS][ERROR] al obtener leads:', err.message);
+    console.error('⚠️ [LEADS][ERROR] al obtener leads:', err.message);
     res.status(500).send('Error al obtener leads');
   }
 });
@@ -208,7 +207,7 @@ app.get('/leads.csv', async (_req, res) => {
     res.attachment('leads.csv');
     res.send(csv);
   } catch (err) {
-    console.error('[LEADS][CSV][ERROR] al generar CSV:', err.message);
+    console.error('⚠️ [LEADS][CSV][ERROR] al generar CSV:', err.message);
     res.status(500).send('Error al generar CSV');
   }
 });
@@ -220,12 +219,12 @@ app.get('/leads/:email', async (req, res) => {
     if (rows.length === 0) return res.status(404).send('Lead no encontrado');
     res.json(rows[0]);
   } catch (err) {
-    console.error('[LEADS][DETAIL][ERROR] al obtener lead:', err.message);
+    console.error('⚠️ [LEADS][DETAIL][ERROR] al obtener lead:', err.message);
     res.status(500).send('Error al obtener lead');
   }
 });
 
-// --------------------------- Webhook v3.6 ----------------------------
+// --------------------------- Webhook v3.7 ----------------------------
 
 app.post('/webhook', async (req, res) => {
   const data = req.body;
@@ -235,10 +234,10 @@ app.post('/webhook', async (req, res) => {
   const ts      = data.timestamp || data.time_sent || data.event_timestamp || data.occurred_at || new Date().toISOString();
   const eventAt = new Date(ts);
 
-  console.log(`[WEBHOOK][IN] type=${rawType || '-'} email=${email || '-'} ts=${ts}`);
+  console.log(`📩 [WEBHOOK][IN] type=${rawType || '-'} email=${email || '-'} ts=${ts}`);
 
   if (!rawType || !email || !ts) {
-    console.log('[WEBHOOK][SKIP] faltan datos clave');
+    console.log('⚠️ [WEBHOOK][SKIP] faltan datos clave');
     return res.status(400).send('Faltan datos clave');
   }
 
@@ -262,11 +261,11 @@ app.post('/webhook', async (req, res) => {
     );
     const { rowCount } = await pool.query('SELECT 1 FROM lead_events_dedup WHERE event_id = $1', [eventId]);
     if (rowCount === 0) {
-      console.log(`[WEBHOOK][DEDUP] duplicate email=${email} type=${event_type}`);
+      console.log(`♻️ [WEBHOOK][DEDUP] duplicate email=${email} type=${event_type}`);
       return res.status(200).send('Evento duplicado ignorado');
     }
   } catch (e) {
-    console.warn('[WEBHOOK][DEDUP][WARN]', e.message);
+    console.warn('⚠️ [WEBHOOK][DEDUP][WARN]', e.message);
   }
 
   try {
@@ -280,7 +279,7 @@ app.post('/webhook', async (req, res) => {
         [email]
       );
       r = await pool.query('SELECT * FROM leads WHERE email = $1', [email]);
-      console.log(`[WEBHOOK][NEW-LEAD] email=${email}`);
+      console.log(`🆕 [WEBHOOK][NEW-LEAD] email=${email}`);
     }
     const lead = r.rows[0];
 
@@ -318,7 +317,7 @@ app.post('/webhook', async (req, res) => {
           [email, eventAt, ua, ip, isSuspicious]
         );
       } catch (e) {
-        console.warn('[WEBHOOK][OPEN][WARN] al guardar open', e.message);
+        console.warn('⚠️ [WEBHOOK][OPEN][WARN]', e.message);
       }
     }
 
@@ -336,7 +335,7 @@ app.post('/webhook', async (req, res) => {
       newScore += 10;
     }
 
-    // Segmentación con score + señales humanas (clicks/replies + opens humanos del píxel)
+    // Segmentación (solo cuando hay click/reply)
     if (event_type === 'email_click' || event_type === 'email_reply') {
       const humanOpens = lead.human_open_count || 0;
       const humanSignals =
@@ -358,8 +357,8 @@ app.post('/webhook', async (req, res) => {
       await pool.query(sql, values);
     }
 
-    const secsStr = secondsSinceSend !== null ? ` secsSinceSend=${secondsSinceSend.toFixed(2)}` : '';
-    console.log(`[WEBHOOK][OK] email=${email} event=${event_type} seg=${segment} score=${newScore}${secsStr}`);
+    const secsStr = secondsSinceSend !== null ? ` secs=${secondsSinceSend.toFixed(2)}` : '';
+    console.log(`✅ [WEBHOOK][OK] email=${email} event=${event_type} seg=${segment} score=${newScore}${secsStr}`);
 
     res.send('OK');
   } catch (err) {
@@ -368,7 +367,7 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// ------------------------- Píxel /o.gif v3.6 ---------------------------
+// ------------------------- Píxel /o.gif v3.7 ---------------------------
 
 app.get('/o.gif', async (req, res) => {
   try {
@@ -390,13 +389,13 @@ app.get('/o.gif', async (req, res) => {
         [email]
       );
       r = await pool.query('SELECT * FROM leads WHERE email = $1', [email]);
-      console.log(`[PIXEL][NEW-LEAD] email=${email}`);
+      console.log(`🆕 [PIXEL][NEW-LEAD] email=${email}`);
     }
     const lead = r.rows[0];
 
     const now = new Date();
 
-    // UA/IP reales del cliente (o proxy/bot)
+    // UA/IP reales
     const ua = req.headers['user-agent'] || '';
     const ip = (req.headers['x-real-ip'] || req.headers['x-forwarded-for'] || req.ip || '').toString();
 
@@ -438,7 +437,7 @@ app.get('/o.gif', async (req, res) => {
         );
       }
     } catch (e) {
-      console.warn('[PIXEL][OPEN][WARN] al guardar open:', e.message);
+      console.warn('⚠️ [PIXEL][OPEN][WARN] al guardar open:', e.message);
     }
 
     // Si NO es humano → solo contamos sospechoso
@@ -452,17 +451,17 @@ app.get('/o.gif', async (req, res) => {
           [email, now]
         );
       } catch (e) {
-        console.warn('[PIXEL][SUSP][WARN] al actualizar suspicious_open_count:', e.message);
+        console.warn('⚠️ [PIXEL][SUSP][WARN] al actualizar suspicious_open_count:', e.message);
       }
 
       const secsStr = secondsSinceSend !== null ? ` secs=${secondsSinceSend.toFixed(2)}` : '';
-      console.log(`[PIXEL][BOT] email=${email} mid=${mid || '-'} seg=${lead.segment_v2} score=${lead.score_v2} reason=${reason || 'unknown'}${secsStr}`);
+      console.log(`🤖 [PIXEL][BOT] email=${email} mid=${mid || '-'} seg=${lead.segment_v2} score=${lead.score_v2} reason=${reason || 'unknown'}${secsStr}`);
 
       sendGif(res);
       return;
     }
 
-    // Es humano → dedup solo por mid (una vez por email)
+    // Es humano → dedup solo por mid (una vez por correo)
     let alreadyScored = false;
     if (mid) {
       const scoreEventId = `pixel-score-${email}-${mid}`;
@@ -477,7 +476,7 @@ app.get('/o.gif', async (req, res) => {
           alreadyScored = true;
         }
       } catch (e) {
-        console.warn('[PIXEL][SCORE-DEDUP][WARN]', e.message);
+        console.warn('⚠️ [PIXEL][SCORE-DEDUP][WARN]', e.message);
       }
     }
 
@@ -521,7 +520,7 @@ app.get('/o.gif', async (req, res) => {
 
     const secsStr = secondsSinceSend !== null ? ` secs=${secondsSinceSend.toFixed(2)}` : '';
     console.log(
-      `[PIXEL][HUMAN] email=${email} mid=${mid || '-'} reason=${reason || 'unknown'} scored=${scoredThisPixel}` +
+      `👀 [PIXEL][HUMAN] email=${email} mid=${mid || '-'} reason=${reason || 'unknown'} scored=${scoredThisPixel}` +
       ` score=${lead.score_v2}->${newScore} seg=${lead.segment_v2}->${segment}` +
       ` opens=${lead.human_open_count || 0}->${(lead.human_open_count || 0) + deltaHumanOpens}${secsStr}`
     );
@@ -536,7 +535,7 @@ app.get('/o.gif', async (req, res) => {
 // ----------------------------- Start ------------------------------
 
 app.listen(port, async () => {
-  console.log(`🚀 API Engagement v3.6 corriendo en puerto ${port}`);
+  console.log('🚀 API Engagement v3.7 corriendo en puerto ' + port);
   try {
     await pool.query('SELECT NOW()');
     console.log('✅ [DB] Conexión exitosa a PostgreSQL');
