@@ -1,19 +1,15 @@
-// ======================= ESP Server v3.7 (Engagement Scoring) =======================
+// ======================= ESP Server v3.8 (Engagement Scoring) =======================
 // - Webhook /webhook (Smartlead):
-//     * sent/click/reply actualizan métricas y score
-//     * open SOLO registra actividad; NO suma opens humanos ni score
+//     * sent/click/reply actualizan métricas y score_v2
+//     * open SOLO registra actividad; NO suma opens humanos ni score_v2
 // - Píxel /o.gif:
 //     * ÚNICA fuente que:
 //         - incrementa open_count_v2
 //         - incrementa human_open_count
-//         - suma puntos de score_v2 por open
-//     * Heurística anti-bot estricta (UA/IP/timing):
-//         - tooFast => BOT
-//         - gateways/proxies claros => BOT
-//         - UA humano + no proxy => HUMANO FUERTE
-//         - Gmail/Apple proxy “después de un rato” => HUMANO PROBABILÍSTICO
-//     * lead_open_events_v2 con UPDATE→INSERT (no depende de UNIQUE)
-//     * dedup de score por mid vía lead_events_dedup (solo para score, SIN dedup por día)
+//         - suma puntos de score_v2 por open (máx 1 vez por mid)
+//     * Heurística anti-bot (UA/IP/timing)
+//     * lead_open_events_v2: UPDATE→INSERT (no depende de UNIQUE)
+//     * dedup de score por mid vía lead_events_dedup usando RETURNING (sin fallos de carrera)
 // ================================================================================
 
 const express    = require('express');
@@ -186,7 +182,7 @@ setInterval(() => console.log('🌀 [SYS] keepalive'), 25 * 1000);
 
 // -------------------------- Rutas lectura --------------------------
 
-app.get('/', (_req, res) => res.send('✅ API Engagement v3.7 funcionando correctamente'));
+app.get('/', (_req, res) => res.send('✅ API Engagement v3.8 funcionando correctamente'));
 
 app.get('/leads', async (_req, res) => {
   try {
@@ -224,7 +220,7 @@ app.get('/leads/:email', async (req, res) => {
   }
 });
 
-// --------------------------- Webhook v3.7 ----------------------------
+// --------------------------- Webhook v3.8 ----------------------------
 
 app.post('/webhook', async (req, res) => {
   const data = req.body;
@@ -251,15 +247,15 @@ app.post('/webhook', async (req, res) => {
   const ua = extractUA(data, req.headers);
   const ip = extractIP(data, req.headers, req.ip);
 
-  // Idempotencia webhook
-  const eventId = data.event_id || data.id || `${email}-${event_type}-${eventAt.getTime()}`;
+  // Idempotencia webhook con RETURNING
   try {
-    await pool.query(
+    const { rowCount } = await pool.query(
       `INSERT INTO lead_events_dedup (event_id, email, event_type)
-       VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`,
-      [eventId, email, event_type]
+       VALUES ($1,$2,$3)
+       ON CONFLICT (event_id) DO NOTHING
+       RETURNING 1`,
+      [data.event_id || data.id || `${email}-${event_type}-${eventAt.getTime()}`, email, event_type]
     );
-    const { rowCount } = await pool.query('SELECT 1 FROM lead_events_dedup WHERE event_id = $1', [eventId]);
     if (rowCount === 0) {
       console.log(`♻️ [WEBHOOK][DEDUP] duplicate email=${email} type=${event_type}`);
       return res.status(200).send('Evento duplicado ignorado');
@@ -367,7 +363,7 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// ------------------------- Píxel /o.gif v3.7 ---------------------------
+// ------------------------- Píxel /o.gif v3.8 ---------------------------
 
 app.get('/o.gif', async (req, res) => {
   try {
@@ -461,17 +457,19 @@ app.get('/o.gif', async (req, res) => {
       return;
     }
 
-    // Es humano → dedup solo por mid (una vez por correo)
+    // Es humano → dedup solo por mid (una vez por correo) usando RETURNING
     let alreadyScored = false;
     if (mid) {
-      const scoreEventId = `pixel-score-${email}-${mid}`;
       try {
-        await pool.query(
+        const { rowCount } = await pool.query(
           `INSERT INTO lead_events_dedup (event_id, email, event_type)
-           VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`,
-          [scoreEventId, email, 'email_open_pixel_score']
+           VALUES ($1,$2,$3)
+           ON CONFLICT (event_id) DO NOTHING
+           RETURNING 1`,
+          [`pixel-score-${email}-${mid}`, email, 'email_open_pixel_score']
         );
-        const { rowCount } = await pool.query('SELECT 1 FROM lead_events_dedup WHERE event_id = $1', [scoreEventId]);
+        // rowCount === 1  => primera vez que vemos este mid → NO estaba puntuado
+        // rowCount === 0  => ya existía → YA estaba puntuado antes
         if (rowCount === 0) {
           alreadyScored = true;
         }
@@ -535,7 +533,7 @@ app.get('/o.gif', async (req, res) => {
 // ----------------------------- Start ------------------------------
 
 app.listen(port, async () => {
-  console.log('🚀 API Engagement v3.7 corriendo en puerto ' + port);
+  console.log('🚀 API Engagement v3.8 corriendo en puerto ' + port);
   try {
     await pool.query('SELECT NOW()');
     console.log('✅ [DB] Conexión exitosa a PostgreSQL');
