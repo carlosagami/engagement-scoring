@@ -1,4 +1,4 @@
-// ======================= ESP Server v4.0 (Engagement Scoring) =======================
+// ======================= ESP Server v4.1 (Engagement Scoring) =======================
 // - Webhook /webhook (Smartlead):
 //     * sent/click/reply actualizan métricas y score_v2
 //     * open SOLO registra actividad; NO suma opens humanos ni score_v2
@@ -13,7 +13,7 @@
 //         - Gmail Image Proxy / Apple MPP con delay => HUMANO
 //         - Outlook real (no proxy) con delay => HUMANO
 //         - TODO lo demás => BOT
-//     * lead_open_events_v2: INSERT ... ON CONFLICT (email, message_base) DO UPDATE
+//     * lead_open_events_v2: UPDATE→INSERT (no depende de UNIQUE)
 //     * dedup de score por mid vía lead_events_dedup usando RETURNING
 // ================================================================================
 
@@ -204,7 +204,7 @@ setInterval(() => console.log('🌀 [SYS] keepalive'), 25 * 1000);
 
 // -------------------------- Rutas lectura --------------------------
 
-app.get('/', (_req, res) => res.send('✅ API Engagement v4.0 funcionando correctamente'));
+app.get('/', (_req, res) => res.send('✅ API Engagement v4.1 funcionando correctamente'));
 
 app.get('/leads', async (_req, res) => {
   try {
@@ -242,7 +242,7 @@ app.get('/leads/:email', async (req, res) => {
   }
 });
 
-// --------------------------- Webhook v4.0 ----------------------------
+// --------------------------- Webhook v4.1 ----------------------------
 
 app.post('/webhook', async (req, res) => {
   const data = req.body;
@@ -386,7 +386,7 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// ------------------------- Píxel /o.gif v4.0 ---------------------------
+// ------------------------- Píxel /o.gif v4.1 ---------------------------
 
 app.get('/o.gif', async (req, res) => {
   try {
@@ -427,19 +427,27 @@ app.get('/o.gif', async (req, res) => {
       secondsSinceSend
     });
 
-    // Registrar/actualizar evento de open usando el UNIQUE (email, message_base)
+    // Registrar/actualizar evento de open SIN depender de UNIQUE
     try {
       if (mid) {
-        await pool.query(
-          `INSERT INTO lead_open_events_v2 (email, message_base, opened_at, user_agent, ip, is_suspicious)
-           VALUES ($1,$2,$3,$4,$5,$6)
-           ON CONFLICT (email, message_base) DO UPDATE
-           SET opened_at    = EXCLUDED.opened_at,
-               user_agent   = EXCLUDED.user_agent,
-               ip           = EXCLUDED.ip,
-               is_suspicious= EXCLUDED.is_suspicious`,
+        const upd = await pool.query(
+          `UPDATE lead_open_events_v2
+           SET opened_at    = $3,
+               user_agent   = $4,
+               ip           = $5,
+               is_suspicious= $6
+           WHERE email = $1
+             AND message_base = $2`,
           [email, mid, now, ua, ip, !!isSuspicious]
         );
+
+        if (upd.rowCount === 0) {
+          await pool.query(
+            `INSERT INTO lead_open_events_v2 (email, message_base, opened_at, user_agent, ip, is_suspicious)
+             VALUES ($1,$2,$3,$4,$5,$6)`,
+            [email, mid, now, ua, ip, !!isSuspicious]
+          );
+        }
       } else {
         await pool.query(
           `INSERT INTO lead_open_events_v2 (email, opened_at, user_agent, ip, is_suspicious)
@@ -546,7 +554,7 @@ app.get('/o.gif', async (req, res) => {
 // ----------------------------- Start ------------------------------
 
 app.listen(port, async () => {
-  console.log('🚀 API Engagement v4.0 corriendo en puerto ' + port);
+  console.log('🚀 API Engagement v4.1 corriendo en puerto ' + port);
   try {
     await pool.query('SELECT NOW()');
     console.log('✅ [DB] Conexión exitosa a PostgreSQL');
