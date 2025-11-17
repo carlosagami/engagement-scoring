@@ -1,4 +1,4 @@
-// ======================= ESP Server v3.5 (Engagement Scoring) =======================
+// ======================= ESP Server v3.6 (Engagement Scoring) =======================
 // - Webhook /webhook (Smartlead):
 //     * sent/click/reply actualizan métricas y score
 //     * open SOLO registra actividad; NO suma opens humanos ni score
@@ -13,7 +13,7 @@
 //         - UA humano + no proxy => HUMANO FUERTE
 //         - Gmail/Apple proxy “después de un rato” => HUMANO PROBABILÍSTICO
 //     * lead_open_events_v2 con UPDATE→INSERT (no depende de UNIQUE)
-//     * dedup de score por mid vía lead_events_dedup (solo para score)
+//     * dedup de score por mid vía lead_events_dedup (solo para score, ya SIN dedup por día)
 // ================================================================================
 
 const express    = require('express');
@@ -41,7 +41,7 @@ const pool = new Pool({
 // -------------------------- Constantes & Config --------------------------
 
 const PIXEL_MIN_SECONDS_HUMAN = 5;    // <5s desde last_sent_v2 = sospechoso
-const SAME_DAY_OPEN_DEDUP     = true; // si true, no sumamos score dos veces el mismo día por píxel
+// NOTA: ya NO usamos dedup por día; solo por mid
 
 // -------------------- Utilidades & Heurísticas --------------------
 
@@ -66,12 +66,6 @@ function looksLikeHumanUA(ua = '') {
     // Fall-back outlook raro
     /(mozilla\/5\.0).*?(windows nt|macintosh).*?(outlook)/i.test(s)
   );
-}
-
-function sameDay(a, b) {
-  if (!a || !b) return false;
-  const A = new Date(a), B = new Date(b);
-  return A.toDateString() === B.toDateString();
 }
 
 // Extracción robusta para webhook (Smartlead / otros ESPs)
@@ -119,10 +113,6 @@ function sendGif(res) {
 }
 
 // Clasificación del hit del píxel:
-// - UA humano + no proxy (UA/IP)      => humano fuerte
-// - Gmail/Apple proxy tras cierto tiempo => humano probabilístico
-// - demasiado rápido                  => sospechoso siempre
-// - gateways (Proofpoint, Mimecast…)  => sospechoso
 function classifyPixelOpen({ ua, ip, secondsSinceSend }) {
   const uaLower = (ua || '').toLowerCase();
 
@@ -156,7 +146,6 @@ function classifyPixelOpen({ ua, ip, secondsSinceSend }) {
 
   // 3) Gmail proxy / Apple MPP
   if (isGoogleImageProxy || isAppleMPP) {
-    // Si siguen pegados al envío, no nos fiamos
     if (secondsSinceSend !== null && secondsSinceSend < (PIXEL_MIN_SECONDS_HUMAN + 2)) {
       return {
         isHuman: false,
@@ -166,7 +155,6 @@ function classifyPixelOpen({ ua, ip, secondsSinceSend }) {
       };
     }
 
-    // Si ya pasó un rato razonable, lo usamos como humano probabilístico
     return {
       isHuman: true,
       isSuspicious: false,
@@ -199,12 +187,12 @@ setInterval(() => console.log('[SYS][KEEPALIVE]'), 25 * 1000);
 
 // -------------------------- Rutas lectura --------------------------
 
-app.get('/', (_req, res) => res.send('✅ API Engagement v3.5 funcionando correctamente'));
+app.get('/', (_req, res) => res.send('✅ API Engagement v3.6 funcionando correctamente'));
 
 app.get('/leads', async (_req, res) => {
   try {
     const { rows } = await pool.query('SELECT * FROM leads ORDER BY email');
-    res.json(rows);
+  res.json(rows);
   } catch (err) {
     console.error('[LEADS][ERROR] al obtener leads:', err.message);
     res.status(500).send('Error al obtener leads');
@@ -237,9 +225,7 @@ app.get('/leads/:email', async (req, res) => {
   }
 });
 
-// --------------------------- Webhook v3.5 ----------------------------
-// - sent/click/reply impactan score y segmento
-// - open solo registra actividad (NO suma opens ni score)
+// --------------------------- Webhook v3.6 ----------------------------
 
 app.post('/webhook', async (req, res) => {
   const data = req.body;
@@ -332,7 +318,7 @@ app.post('/webhook', async (req, res) => {
           [email, eventAt, ua, ip, isSuspicious]
         );
       } catch (e) {
-        console.warn('[WEBHOOK][OPEN][WARN]', e.message);
+        console.warn('[WEBHOOK][OPEN][WARN] al guardar open', e.message);
       }
     }
 
@@ -382,9 +368,7 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// ------------------------- Píxel /o.gif v3.5 ---------------------------
-// /o.gif?e=<email>&m=<message_base_id>
-// Aquí es donde se decide quién cuenta como open humano y suma score.
+// ------------------------- Píxel /o.gif v3.6 ---------------------------
 
 app.get('/o.gif', async (req, res) => {
   try {
@@ -425,7 +409,7 @@ app.get('/o.gif', async (req, res) => {
       secondsSinceSend
     });
 
-    // ----------------- Registrar/actualizar evento de open -----------------
+    // Registrar/actualizar evento de open
     try {
       if (mid) {
         const upd = await pool.query(
@@ -457,7 +441,7 @@ app.get('/o.gif', async (req, res) => {
       console.warn('[PIXEL][OPEN][WARN] al guardar open:', e.message);
     }
 
-    // ----------------- Si NO es humano → solo contamos sospechoso -----------------
+    // Si NO es humano → solo contamos sospechoso
     if (!isHuman) {
       try {
         await pool.query(
@@ -478,7 +462,7 @@ app.get('/o.gif', async (req, res) => {
       return;
     }
 
-    // ----------------- Es humano → ver si ya se puntuó ese mid -----------------
+    // Es humano → dedup solo por mid (una vez por email)
     let alreadyScored = false;
     if (mid) {
       const scoreEventId = `pixel-score-${email}-${mid}`;
@@ -497,9 +481,6 @@ app.get('/o.gif', async (req, res) => {
       }
     }
 
-    const lastOpenV2 = lead.last_open_v2 ? new Date(lead.last_open_v2) : null;
-    const isSameDay = SAME_DAY_OPEN_DEDUP && lastOpenV2 && sameDay(lastOpenV2, now);
-
     let updates = [];
     let values  = [email];
     let i       = 2;
@@ -511,7 +492,7 @@ app.get('/o.gif', async (req, res) => {
     let deltaHumanOpens = 0;
     let scoredThisPixel = false;
 
-    if (!alreadyScored && !isSameDay) {
+    if (!alreadyScored) {
       updates.push(`open_count_v2 = COALESCE(open_count_v2,0) + 1`);
       updates.push(`human_open_count = COALESCE(human_open_count,0) + 1`);
       newScore += 1;
@@ -555,7 +536,7 @@ app.get('/o.gif', async (req, res) => {
 // ----------------------------- Start ------------------------------
 
 app.listen(port, async () => {
-  console.log(`🚀 API Engagement v3.5 corriendo en puerto ${port}`);
+  console.log(`🚀 API Engagement v3.6 corriendo en puerto ${port}`);
   try {
     await pool.query('SELECT NOW()');
     console.log('✅ [DB] Conexión exitosa a PostgreSQL');
