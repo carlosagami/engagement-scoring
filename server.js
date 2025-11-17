@@ -7,7 +7,7 @@
 //     * heurística anti-bot (UA/IP/timing) con posibilidad de:
 //         - primer hit sospechoso
 //         - segundo hit humano DESPUÉS (mismo mid) que SÍ suma score
-//     * ON CONFLICT sobre (email, message_base) en lead_open_events_v2
+//     * lead_open_events_v2 se maneja con UPDATE→INSERT (no depende de UNIQUE)
 //     * dedup de score por mid vía lead_events_dedup (solo para score)
 // - Rutas lectura: /, /leads, /leads.csv, /leads/:email
 // - Idempotencia webhook: lead_events_dedup
@@ -317,16 +317,15 @@ app.post('/webhook', async (req, res) => {
       try {
         await pool.query(
           `INSERT INTO lead_open_events_v2 (email, opened_at, user_agent, ip, is_suspicious)
-           VALUES ($1,$2,$3,$4,$5)
-           ON CONFLICT DO NOTHING`,
+           VALUES ($1,$2,$3,$4,$5)`,
           [email, eventAt, ua, ip, isSuspicious]
         );
       } catch (e) {
-        console.warn('⚠️ Error guardando auditoría open (webhook):', e.message);
+        console.warn('⚠️ Error guardando open (webhook):', e.message);
       }
     }
 
-    // Click
+    // Click (por ahora sin heurística anti-bot; eso lo metemos después)
     if (event_type === 'email_click') {
       updates.push(`last_click_v2 = $${i++}`); values.push(eventAt);
       updates.push(`click_count_v2 = COALESCE(click_count_v2,0) + 1`);
@@ -374,7 +373,7 @@ app.post('/webhook', async (req, res) => {
 // /o.gif?e=<email>&m=<message_base_id>
 //
 // - Clasifica cada hit (sospechoso / humano) usando timing + UA.
-// - Inserta/actualiza lead_open_events_v2 con ON CONFLICT (email,message_base).
+// - Maneja lead_open_events_v2 con UPDATE→INSERT (email,message_base).
 // - Permite primer hit sospechoso y luego uno humano que SÍ sume score.
 // - Usa lead_events_dedup SOLO para dedup de score (event_id = pixel-score-...).
 
@@ -420,17 +419,28 @@ app.get('/o.gif', async (req, res) => {
     // ----------------- Registrar/actualizar evento de open -----------------
     try {
       if (mid) {
-        await pool.query(
-          `INSERT INTO lead_open_events_v2 (email, opened_at, user_agent, ip, is_suspicious, message_base)
-           VALUES ($1,$2,$3,$4,$5,$6)
-           ON CONFLICT (email, message_base) DO UPDATE
-           SET opened_at    = EXCLUDED.opened_at,
-               user_agent   = EXCLUDED.user_agent,
-               ip           = EXCLUDED.ip,
-               is_suspicious= EXCLUDED.is_suspicious`,
-          [email, now, ua, ip, !!isSuspicious, mid]
+        // 1) Intentar actualizar si ya existe ese email+message_base
+        const upd = await pool.query(
+          `UPDATE lead_open_events_v2
+           SET opened_at    = $3,
+               user_agent   = $4,
+               ip           = $5,
+               is_suspicious= $6
+           WHERE email = $1
+             AND message_base = $2`,
+          [email, mid, now, ua, ip, !!isSuspicious]
         );
+
+        // 2) Si no existía, insertar
+        if (upd.rowCount === 0) {
+          await pool.query(
+            `INSERT INTO lead_open_events_v2 (email, message_base, opened_at, user_agent, ip, is_suspicious)
+             VALUES ($1,$2,$3,$4,$5,$6)`,
+            [email, mid, now, ua, ip, !!isSuspicious]
+          );
+        }
       } else {
+        // Caso sin mid: insert simple
         await pool.query(
           `INSERT INTO lead_open_events_v2 (email, opened_at, user_agent, ip, is_suspicious)
            VALUES ($1,$2,$3,$4,$5)`,
@@ -457,7 +467,8 @@ app.get('/o.gif', async (req, res) => {
 
       console.log(
         `pixel ⚠️ ${email} → ${lead.segment_v2} (score_v2 ${lead.score_v2}) | open 🤖 sospechoso (pixel${mid ? ' msg' : ' no-mid'}) | reason=${reason || ''}` +
-        (secondsSinceSend !== null ? ` | secsSinceSend=${secondsSinceSend.toFixed(2)}` : '')
+        (secondsSinceSend !== null ? ` | secsSinceSend=${secondsSinceSend.toFixed(2)}` : '') +
+        ` | ua="${ua}"`
       );
       sendGif(res);
       return;
@@ -526,7 +537,8 @@ app.get('/o.gif', async (req, res) => {
 
     console.log(
       `pixel ✅ ${email} → ${segment} (score_v2 ${newScore}) | open 🧑 humano (pixel${mid ? ' msg' : ' no-mid'}) | reason=${reason || ''}` +
-      (secondsSinceSend !== null ? ` | secsSinceSend=${secondsSinceSend.toFixed(2)}` : '')
+      (secondsSinceSend !== null ? ` | secsSinceSend=${secondsSinceSend.toFixed(2)}` : '') +
+      ` | ua="${ua}"`
     );
 
     sendGif(res);
