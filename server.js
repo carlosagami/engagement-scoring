@@ -1,18 +1,20 @@
-// ======================= ESP Server v3.3 (Engagement Scoring) =======================
+// ======================= ESP Server v3.4 (Engagement Scoring) =======================
 // - Webhook /webhook (Smartlead):
 //     * sent/click/reply actualizan métricas y score
-//     * open solo registra actividad; el score de opens viene del píxel
+//     * open SOLO registra actividad; NO suma opens humanos ni score
 // - Píxel /o.gif:
 //     * fuente principal y confiable de opens
 //     * heurística anti-bot (UA/IP/timing) estricta:
-//         - abre demasiado rápido => BOT
-//         - gateways/proxies “claros” => BOT
+//         - tooFast => BOT
+//         - gateways/proxies claros => BOT
 //         - UA humano + no proxy => HUMANO FUERTE
 //         - Gmail/Apple proxy “después de un rato” => HUMANO PROBABILÍSTICO
+//     * SOLO aquí se actualizan:
+//         - open_count_v2
+//         - human_open_count
+//         - puntos de score_v2 por open
 //     * lead_open_events_v2 se maneja con UPDATE→INSERT (no depende de UNIQUE)
 //     * dedup de score por mid vía lead_events_dedup (solo para score)
-// - Rutas lectura: /, /leads, /leads.csv, /leads/:email
-// - Idempotencia webhook: lead_events_dedup
 // ================================================================================
 
 const express    = require('express');
@@ -44,14 +46,15 @@ const SAME_DAY_OPEN_DEDUP     = true; // si true, no sumamos score dos veces el 
 
 // -------------------- Utilidades & Heurísticas --------------------
 
+// Detecta UAs que realmente son proxies/gateways de imagen, NO navegadores normales
 function looksLikeProxyUA(ua = '') {
   const s = ua.toLowerCase();
-  return /(googleimageproxy|google proxy|mpp|apple|icloud|outlook-httpproxy|outlookimgcache|microsoft-httpproxy|office365-httpproxy|proofpoint|mimecast|barracuda|trendmicro|symantec|sophos)/i.test(s);
+  return /googleimageproxy|google proxy|outlook-httpproxy|outlookimgcache|microsoft-httpproxy|office365-httpproxy|proofpoint|mimecast|barracuda|trendmicro|symantec|sophos/.test(s);
 }
 
 function looksLikeProxyIP(ip = '') {
   const s = String(ip || '').toLowerCase();
-  return /(google|microsoft|outlook|office|icloud|apple|yahoo|aol|proofpoint|mimecast)/i.test(s);
+  return /(google|microsoft|outlook|office|icloud|apple mail|yahoo|aol|proofpoint|mimecast)/.test(s);
 }
 
 function looksLikeHumanUA(ua = '') {
@@ -197,7 +200,7 @@ setInterval(() => console.log('[SYS][KEEPALIVE] ping cada 25 segundos'), 25 * 10
 
 // -------------------------- Rutas lectura --------------------------
 
-app.get('/', (_req, res) => res.send('✅ API Engagement v3.3 funcionando correctamente'));
+app.get('/', (_req, res) => res.send('✅ API Engagement v3.4 funcionando correctamente'));
 
 app.get('/leads', async (_req, res) => {
   try {
@@ -235,9 +238,9 @@ app.get('/leads/:email', async (req, res) => {
   }
 });
 
-// --------------------------- Webhook v3.3 ----------------------------
+// --------------------------- Webhook v3.4 ----------------------------
 // - sent/click/reply impactan score y segmento
-// - open solo registra actividad (no suma opens humanos; eso es del píxel)
+// - open solo registra actividad (NO suma opens ni score)
 
 app.post('/webhook', async (req, res) => {
   const data = req.body;
@@ -258,7 +261,7 @@ app.post('/webhook', async (req, res) => {
     /open/.test(rawType)          ? 'email_open'  :
     /click/.test(rawType)         ? 'email_click' :
     /reply|respond/.test(rawType) ? 'email_reply' :
-    /sent|delivered/.test(rawType)? 'email_sent'  :
+    /sent|delivered|delivery/.test(rawType)? 'email_sent'  :
     rawType;
 
   const ua = extractUA(data, req.headers);
@@ -316,7 +319,7 @@ app.post('/webhook', async (req, res) => {
       updates.push(`last_sent_v2 = $${i++}`); values.push(eventAt);
     }
 
-    // Open (solo registro, no score)
+    // Open (solo registro, NO score, NO human_open_count)
     if (event_type === 'email_open') {
       const isSuspicious =
         !uaIsHuman || uaIsProxy || ipIsProxy || tooFast;
@@ -334,7 +337,7 @@ app.post('/webhook', async (req, res) => {
       }
     }
 
-    // Click (sin heurística anti-bot por ahora)
+    // Click
     if (event_type === 'email_click') {
       updates.push(`last_click_v2 = $${i++}`); values.push(eventAt);
       updates.push(`click_count_v2 = COALESCE(click_count_v2,0) + 1`);
@@ -385,8 +388,9 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// ------------------------- Píxel /o.gif v3.3 ---------------------------
+// ------------------------- Píxel /o.gif v3.4 ---------------------------
 // /o.gif?e=<email>&m=<message_base_id>
+// Aquí es donde se decide quién cuenta como open humano y suma score.
 
 app.get('/o.gif', async (req, res) => {
   try {
@@ -572,10 +576,10 @@ app.get('/o.gif', async (req, res) => {
 // ----------------------------- Start ------------------------------
 
 app.listen(port, async () => {
-  console.log(`🚀 API Engagement v3.3 corriendo en puerto ${port}`);
+  console.log(`🚀 API Engagement v3.4 corriendo en puerto ${port}`);
   try {
     await pool.query('SELECT NOW()');
-    console.log('✅ Conexión exitosa a PostgreSQL');
+    console.log('✅ [DB] Conexión exitosa a PostgreSQL');
   } catch (err) {
     console.error('❌ [DB][ERROR] conectando a PostgreSQL:', err.message);
   }
