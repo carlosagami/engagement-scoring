@@ -1,4 +1,4 @@
-// ======================= ESP Server v3.8 (Engagement Scoring) =======================
+// ======================= ESP Server v3.9 (Engagement Scoring) =======================
 // - Webhook /webhook (Smartlead):
 //     * sent/click/reply actualizan métricas y score_v2
 //     * open SOLO registra actividad; NO suma opens humanos ni score_v2
@@ -7,9 +7,13 @@
 //         - incrementa open_count_v2
 //         - incrementa human_open_count
 //         - suma puntos de score_v2 por open (máx 1 vez por mid)
-//     * Heurística anti-bot (UA/IP/timing)
-//     * lead_open_events_v2: UPDATE→INSERT (no depende de UNIQUE)
-//     * dedup de score por mid vía lead_events_dedup usando RETURNING (sin fallos de carrera)
+//     * Heurística ultra conservadora:
+//         - tooFast => BOT
+//         - gateways/proxies de seguridad => BOT
+//         - SOLO Gmail Image Proxy / Apple MPP (con delay) => HUMANO
+//         - TODO lo demás => BOT (aunque parezca navegador real)
+//     * lead_open_events_v2: INSERT ... ON CONFLICT (email, message_base) DO UPDATE
+//     * dedup de score por mid vía lead_events_dedup usando RETURNING
 // ================================================================================
 
 const express    = require('express');
@@ -107,7 +111,7 @@ function sendGif(res) {
   res.status(200).end(GIF_1X1, 'binary');
 }
 
-// Clasificación del hit del píxel
+// Clasificación del hit del píxel (versión ultra conservadora)
 function classifyPixelOpen({ ua, ip, secondsSinceSend }) {
   const uaLower = (ua || '').toLowerCase();
 
@@ -115,7 +119,6 @@ function classifyPixelOpen({ ua, ip, secondsSinceSend }) {
   const isAppleMPP         = /(apple|icloud).*(proxy|mail|mpp)/.test(uaLower);
   const isSecurityGateway  = /(proofpoint|mimecast|barracuda|trendmicro|symantec|sophos)/.test(uaLower);
 
-  const looksHuman = looksLikeHumanUA(ua);
   const isProxyUA  = looksLikeProxyUA(ua);
   const isProxyIP  = looksLikeProxyIP(ip);
 
@@ -129,7 +132,7 @@ function classifyPixelOpen({ ua, ip, secondsSinceSend }) {
     };
   }
 
-  // 2) Gateways de seguridad claros
+  // 2) Gateways de seguridad claros (corporativos)
   if (isSecurityGateway) {
     return {
       isHuman: false,
@@ -139,7 +142,7 @@ function classifyPixelOpen({ ua, ip, secondsSinceSend }) {
     };
   }
 
-  // 3) Gmail proxy / Apple MPP
+  // 3) Gmail proxy / Apple MPP → ÚNICAS señales que vamos a tratar como "humanas"
   if (isGoogleImageProxy || isAppleMPP) {
     if (secondsSinceSend !== null && secondsSinceSend < (PIXEL_MIN_SECONDS_HUMAN + 2)) {
       return {
@@ -158,17 +161,18 @@ function classifyPixelOpen({ ua, ip, secondsSinceSend }) {
     };
   }
 
-  // 4) Humano “fuerte”: UA humano y NO huele a proxy
-  if (looksHuman && !isProxyUA && !isProxyIP) {
+  // 4) Todo lo que no pase por proxy conocido → NO lo consideramos humano
+  //    aunque parezca navegador real.
+  if (isProxyUA || isProxyIP || looksLikeHumanUA(ua)) {
     return {
-      isHuman: true,
-      isSuspicious: false,
+      isHuman: false,
+      isSuspicious: true,
       secondsSinceSend,
-      reason: 'humanUA_strict'
+      reason: 'non_proxy_ua'
     };
   }
 
-  // 5) Todo lo demás => sospechoso
+  // 5) Resto → también sospechoso
   return {
     isHuman: false,
     isSuspicious: true,
@@ -182,7 +186,7 @@ setInterval(() => console.log('🌀 [SYS] keepalive'), 25 * 1000);
 
 // -------------------------- Rutas lectura --------------------------
 
-app.get('/', (_req, res) => res.send('✅ API Engagement v3.8 funcionando correctamente'));
+app.get('/', (_req, res) => res.send('✅ API Engagement v3.9 funcionando correctamente'));
 
 app.get('/leads', async (_req, res) => {
   try {
@@ -220,7 +224,7 @@ app.get('/leads/:email', async (req, res) => {
   }
 });
 
-// --------------------------- Webhook v3.8 ----------------------------
+// --------------------------- Webhook v3.9 ----------------------------
 
 app.post('/webhook', async (req, res) => {
   const data = req.body;
@@ -248,13 +252,14 @@ app.post('/webhook', async (req, res) => {
   const ip = extractIP(data, req.headers, req.ip);
 
   // Idempotencia webhook con RETURNING
+  const eventId = data.event_id || data.id || `${email}-${event_type}-${eventAt.getTime()}`;
   try {
     const { rowCount } = await pool.query(
       `INSERT INTO lead_events_dedup (event_id, email, event_type)
        VALUES ($1,$2,$3)
        ON CONFLICT (event_id) DO NOTHING
        RETURNING 1`,
-      [data.event_id || data.id || `${email}-${event_type}-${eventAt.getTime()}`, email, event_type]
+      [eventId, email, event_type]
     );
     if (rowCount === 0) {
       console.log(`♻️ [WEBHOOK][DEDUP] duplicate email=${email} type=${event_type}`);
@@ -363,7 +368,7 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// ------------------------- Píxel /o.gif v3.8 ---------------------------
+// ------------------------- Píxel /o.gif v3.9 ---------------------------
 
 app.get('/o.gif', async (req, res) => {
   try {
@@ -404,27 +409,19 @@ app.get('/o.gif', async (req, res) => {
       secondsSinceSend
     });
 
-    // Registrar/actualizar evento de open
+    // Registrar/actualizar evento de open usando el UNIQUE (email, message_base)
     try {
       if (mid) {
-        const upd = await pool.query(
-          `UPDATE lead_open_events_v2
-           SET opened_at    = $3,
-               user_agent   = $4,
-               ip           = $5,
-               is_suspicious= $6
-           WHERE email = $1
-             AND message_base = $2`,
+        await pool.query(
+          `INSERT INTO lead_open_events_v2 (email, message_base, opened_at, user_agent, ip, is_suspicious)
+           VALUES ($1,$2,$3,$4,$5,$6)
+           ON CONFLICT (email, message_base) DO UPDATE
+           SET opened_at    = EXCLUDED.opened_at,
+               user_agent   = EXCLUDED.user_agent,
+               ip           = EXCLUDED.ip,
+               is_suspicious= EXCLUDED.is_suspicious`,
           [email, mid, now, ua, ip, !!isSuspicious]
         );
-
-        if (upd.rowCount === 0) {
-          await pool.query(
-            `INSERT INTO lead_open_events_v2 (email, message_base, opened_at, user_agent, ip, is_suspicious)
-             VALUES ($1,$2,$3,$4,$5,$6)`,
-            [email, mid, now, ua, ip, !!isSuspicious]
-          );
-        }
       } else {
         await pool.query(
           `INSERT INTO lead_open_events_v2 (email, opened_at, user_agent, ip, is_suspicious)
@@ -533,7 +530,7 @@ app.get('/o.gif', async (req, res) => {
 // ----------------------------- Start ------------------------------
 
 app.listen(port, async () => {
-  console.log('🚀 API Engagement v3.8 corriendo en puerto ' + port);
+  console.log('🚀 API Engagement v3.9 corriendo en puerto ' + port);
   try {
     await pool.query('SELECT NOW()');
     console.log('✅ [DB] Conexión exitosa a PostgreSQL');
