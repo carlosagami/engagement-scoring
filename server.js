@@ -1,12 +1,12 @@
-// ======================= ESP Server v3.1 (Engagement Scoring) =======================
+// ======================= ESP Server v3.2 (Engagement Scoring) =======================
 // - Webhook /webhook (Smartlead):
 //     * sent/click/reply actualizan métricas y score
 //     * open registra actividad, pero la FUENTE OFICIAL de opens para score es el píxel
 // - Píxel /o.gif:
 //     * fuente principal y confiable de opens
-//     * heurística anti-bot (UA/IP/timing) con posibilidad de:
-//         - primer hit sospechoso
-//         - segundo hit humano DESPUÉS (mismo mid) que SÍ suma score
+//     * heurística anti-bot (UA/IP/timing) más estricta:
+//         - primer hit sospechoso (tooFast / gateway / proxy)
+//         - segundo hit humano DESPUÉS (mismo mid) que SÍ suma score, si pasa filtros
 //     * lead_open_events_v2 se maneja con UPDATE→INSERT (no depende de UNIQUE)
 //     * dedup de score por mid vía lead_events_dedup (solo para score)
 // - Rutas lectura: /, /leads, /leads.csv, /leads/:email
@@ -37,7 +37,7 @@ const pool = new Pool({
 
 // -------------------------- Constantes & Config --------------------------
 
-const PIXEL_MIN_SECONDS_HUMAN = 5;   // <5s desde last_sent_v2 = sospechoso
+const PIXEL_MIN_SECONDS_HUMAN = 5;    // <5s desde last_sent_v2 = sospechoso
 const SAME_DAY_OPEN_DEDUP     = true; // si true, no sumamos score dos veces el mismo día por píxel
 
 // -------------------- Utilidades & Heurísticas --------------------
@@ -114,9 +114,10 @@ function sendGif(res) {
   res.status(200).end(GIF_1X1, 'binary');
 }
 
-// Clasificación del hit del píxel permitiendo:
-// - primer hit sospechoso (tooFast / gateway)
-// - segundo hit humano si pasa heurística
+// Clasificación del hit del píxel con reglas estrictas:
+// - UA humano + no proxy (UA/IP) => humano fuerte
+// - Gmail proxy / Apple MPP => solo humanos si NO son inmediatos al envío
+// - Demasiado rápido => sospechoso siempre
 function classifyPixelOpen({ ua, ip, secondsSinceSend }) {
   const uaLower = (ua || '').toLowerCase();
   const ipLower = (ip || '').toLowerCase();
@@ -126,8 +127,10 @@ function classifyPixelOpen({ ua, ip, secondsSinceSend }) {
   const isSecurityGateway  = /(proofpoint|mimecast|barracuda|trendmicro|symantec|sophos)/.test(uaLower);
 
   const looksHuman = looksLikeHumanUA(ua);
+  const isProxyUA  = looksLikeProxyUA(ua);
+  const isProxyIP  = looksLikeProxyIP(ip);
 
-  // 1) Too fast desde el envío => inhumano sí o sí
+  // 1) Demasiado rápido desde el envío => inhumano sí o sí
   if (secondsSinceSend !== null && secondsSinceSend < PIXEL_MIN_SECONDS_HUMAN) {
     return {
       isHuman: false,
@@ -137,7 +140,7 @@ function classifyPixelOpen({ ua, ip, secondsSinceSend }) {
     };
   }
 
-  // 2) Gateways de seguridad conocidos (no nos interesa contarlos como humanos)
+  // 2) Gateways de seguridad claros (no nos interesa contarlos como humanos)
   if (isSecurityGateway) {
     return {
       isHuman: false,
@@ -147,36 +150,38 @@ function classifyPixelOpen({ ua, ip, secondsSinceSend }) {
     };
   }
 
-  // 3) UA claramente humano (navegador/cliente de correo)
-  if (looksHuman) {
+  // 3) Gmail proxy / Apple MPP
+  if (isGoogleImageProxy || isAppleMPP) {
+    // Si siguen pegados al envío (menos de unos segundos extra), no nos fiamos
+    if (secondsSinceSend !== null && secondsSinceSend < (PIXEL_MIN_SECONDS_HUMAN + 2)) {
+      return {
+        isHuman: false,
+        isSuspicious: true,
+        secondsSinceSend,
+        reason: 'proxy_too_soon'
+      };
+    }
+
+    // Si ya pasó un rato razonable, los tratamos como "humano probabilístico"
     return {
       isHuman: true,
       isSuspicious: false,
       secondsSinceSend,
-      reason: 'humanUA'
+      reason: isGoogleImageProxy ? 'gmail_proxy_after_delay' : 'apple_mpp_after_delay'
     };
   }
 
-  // 4) Proxies de imagen tipo Gmail / Apple MPP, PERO ya pasó la ventana "tooFast"
-  if (isGoogleImageProxy) {
+  // 4) Humano "fuerte": UA humano y NO huele a proxy ni por UA ni por IP
+  if (looksHuman && !isProxyUA && !isProxyIP) {
     return {
       isHuman: true,
       isSuspicious: false,
       secondsSinceSend,
-      reason: 'gmail_proxy_after_delay'
+      reason: 'humanUA_strict'
     };
   }
 
-  if (isAppleMPP) {
-    return {
-      isHuman: true,
-      isSuspicious: false,
-      secondsSinceSend,
-      reason: 'apple_mpp_after_delay'
-    };
-  }
-
-  // 5) Fallback: lo tratamos como sospechoso
+  // 5) Todo lo demás = sospechoso
   return {
     isHuman: false,
     isSuspicious: true,
@@ -190,7 +195,7 @@ setInterval(() => console.log('🌀 Keep-alive ping cada 25 segundos'), 25 * 100
 
 // -------------------------- Rutas lectura --------------------------
 
-app.get('/', (_req, res) => res.send('✅ API Engagement v3.1 funcionando correctamente'));
+app.get('/', (_req, res) => res.send('✅ API Engagement v3.2 funcionando correctamente'));
 
 app.get('/leads', async (_req, res) => {
   try {
@@ -228,7 +233,7 @@ app.get('/leads/:email', async (req, res) => {
   }
 });
 
-// --------------------------- Webhook v3.1 ----------------------------
+// --------------------------- Webhook v3.2 ----------------------------
 // Webhook: NO suma opens al score.
 // - sent/click/reply: sí impactan score y segment
 // - open: registra actividad (last_open_v2 + lead_open_events_v2)
@@ -240,6 +245,13 @@ app.post('/webhook', async (req, res) => {
   const email   = data.email || data.to_email || data.recipient;
   const ts      = data.timestamp || data.time_sent || data.event_timestamp || data.occurred_at || new Date().toISOString();
   const eventAt = new Date(ts);
+
+  // Log básico de depuración para entender qué viene del ESP
+  console.log('webhook IN =>', {
+    rawType,
+    email,
+    ts
+  });
 
   if (!rawType || !email || !ts) {
     console.log('⚠️ Webhook ignorado por falta de datos clave:', { rawType, email, ts });
@@ -325,7 +337,7 @@ app.post('/webhook', async (req, res) => {
       }
     }
 
-    // Click (por ahora sin heurística anti-bot; eso lo metemos después)
+    // Click (por ahora sin heurística anti-bot; lo afinamos después)
     if (event_type === 'email_click') {
       updates.push(`last_click_v2 = $${i++}`); values.push(eventAt);
       updates.push(`click_count_v2 = COALESCE(click_count_v2,0) + 1`);
@@ -364,15 +376,15 @@ app.post('/webhook', async (req, res) => {
     console.log(`webhook ✅ ${email} → ${segment} (score_v2 ${newScore}) | ${event_type}`);
     res.send('OK');
   } catch (err) {
-    console.error('❌ Error al procesar webhook v3.1:', err.message);
+    console.error('❌ Error al procesar webhook v3.2:', err.message);
     res.status(500).send('Error interno');
   }
 });
 
-// ------------------------- Píxel /o.gif v3.1 ---------------------------
+// ------------------------- Píxel /o.gif v3.2 ---------------------------
 // /o.gif?e=<email>&m=<message_base_id>
 //
-// - Clasifica cada hit (sospechoso / humano) usando timing + UA.
+// - Clasifica cada hit (sospechoso / humano) usando timing + UA + proxy detection.
 // - Maneja lead_open_events_v2 con UPDATE→INSERT (email,message_base).
 // - Permite primer hit sospechoso y luego uno humano que SÍ sume score.
 // - Usa lead_events_dedup SOLO para dedup de score (event_id = pixel-score-...).
@@ -543,7 +555,7 @@ app.get('/o.gif', async (req, res) => {
 
     sendGif(res);
   } catch (e) {
-    console.error('❌ Error en /o.gif v3.1:', e.message);
+    console.error('❌ Error en /o.gif v3.2:', e.message);
     sendGif(res);
   }
 });
@@ -551,7 +563,7 @@ app.get('/o.gif', async (req, res) => {
 // ----------------------------- Start ------------------------------
 
 app.listen(port, async () => {
-  console.log(`🚀 API Engagement v3.1 corriendo en puerto ${port}`);
+  console.log(`🚀 API Engagement v3.2 corriendo en puerto ${port}`);
   try {
     await pool.query('SELECT NOW()');
     console.log('✅ Conexión exitosa a PostgreSQL');
