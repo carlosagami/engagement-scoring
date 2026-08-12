@@ -5,7 +5,8 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "check": "node --check server.js"
+    "check": "node --check server.js && node --check scripts/provision-tracking-domains.js",
+    "domains:sync": "node scripts/provision-tracking-domains.js"
   },
   "dependencies": {
     "dotenv": "^16.0.3",
