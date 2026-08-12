@@ -121,19 +121,40 @@ async function getZone(domain) {
   return zone;
 }
 
-async function upsertCfRecord(zoneId, type, name, content, proxied = false) {
-  const lookup = await cfRequest(`/zones/${zoneId}/dns_records?type=${encodeURIComponent(type)}&name=${encodeURIComponent(name)}`);
+function normalizeCfRecordName(zoneName, name) {
+  const zone = String(zoneName || '').trim().toLowerCase().replace(/\.$/, '');
+  const value = String(name || '').trim().toLowerCase().replace(/\.$/, '');
+  if (!value || !zone) return value;
+  if (value === zone || value.endsWith(`.${zone}`)) return value;
+  return `${value}.${zone}`;
+}
+
+async function upsertCfRecord(zoneId, zoneName, type, name, content, proxied = false) {
+  const fqdn = normalizeCfRecordName(zoneName, name);
+  const lookupPath = `/zones/${zoneId}/dns_records?type=${encodeURIComponent(type)}&name=${encodeURIComponent(fqdn)}`;
+  const lookup = await cfRequest(lookupPath);
   const existing = lookup.result?.[0];
-  const payload = { type, name, content, ttl: 1 };
+  const payload = { type, name: fqdn, content, ttl: 1 };
   if (type === 'CNAME') payload.proxied = proxied;
 
   if (existing) {
     await cfRequest(`/zones/${zoneId}/dns_records/${existing.id}`, { method: 'PUT', body: JSON.stringify(payload) });
-    return { action: 'updated', id: existing.id };
+    return { action: 'updated', id: existing.id, name: fqdn };
   }
 
-  const created = await cfRequest(`/zones/${zoneId}/dns_records`, { method: 'POST', body: JSON.stringify(payload) });
-  return { action: 'created', id: created.result.id };
+  try {
+    const created = await cfRequest(`/zones/${zoneId}/dns_records`, { method: 'POST', body: JSON.stringify(payload) });
+    return { action: 'created', id: created.result.id, name: fqdn };
+  } catch (error) {
+    if (!String(error.message || '').includes('"code":81058')) throw error;
+
+    const retryLookup = await cfRequest(lookupPath);
+    const identical = retryLookup.result?.[0];
+    if (!identical) throw error;
+
+    await cfRequest(`/zones/${zoneId}/dns_records/${identical.id}`, { method: 'PUT', body: JSON.stringify(payload) });
+    return { action: 'existing', id: identical.id, name: fqdn };
+  }
 }
 
 const DOMAINS_QUERY = `
@@ -281,11 +302,11 @@ async function provisionOne(pool, context, row) {
   if (!verificationToken) throw new Error(`Railway did not return verificationToken for ${hostname}`);
 
   const zone = await getZone(row.domain);
-  const cnameResult = await upsertCfRecord(zone.id, 'CNAME', hostname, cnameTarget, true);
-  const txtResult = await upsertCfRecord(zone.id, 'TXT', verificationHost, verificationToken, false);
+  const cnameResult = await upsertCfRecord(zone.id, zone.name, 'CNAME', hostname, cnameTarget, true);
+  const txtResult = await upsertCfRecord(zone.id, zone.name, 'TXT', verificationHost, verificationToken, false);
 
-  console.log(`[CF] CNAME ${cnameResult.action}: ${hostname} -> ${cnameTarget}`);
-  console.log(`[CF] TXT ${txtResult.action}: ${verificationHost}`);
+  console.log(`[CF] CNAME ${cnameResult.action}: ${cnameResult.name} -> ${cnameTarget}`);
+  console.log(`[CF] TXT ${txtResult.action}: ${txtResult.name}`);
 
   railwayDomain = await waitForRailway(context, hostname);
   const dnsValidated = railwayDomain?.status?.verified === true;
