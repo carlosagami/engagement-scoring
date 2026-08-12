@@ -55,28 +55,14 @@ function findNamedObject(root, name) {
 
 function getRailwayContext() {
   const status = runJson('railway', ['status', '--json']);
-  const projectId =
-    status?.project?.id ||
-    status?.id ||
-    status?.projectId ||
-    process.env.RAILWAY_PROJECT_ID;
-
-  const environmentObj =
-    status?.environment ||
-    findNamedObject(status, process.env.RAILWAY_ENVIRONMENT_NAME || 'production');
-  const environmentId =
-    environmentObj?.id || status?.environmentId || process.env.RAILWAY_ENVIRONMENT_ID;
-
-  const serviceObj =
-    status?.service ||
-    findNamedObject(status, SERVICE_NAME);
-  const serviceId =
-    serviceObj?.id || status?.serviceId || process.env.RAILWAY_SERVICE_ID;
+  const projectId = status?.project?.id || status?.id || status?.projectId || process.env.RAILWAY_PROJECT_ID;
+  const environmentObj = status?.environment || findNamedObject(status, process.env.RAILWAY_ENVIRONMENT_NAME || 'production');
+  const environmentId = environmentObj?.id || status?.environmentId || process.env.RAILWAY_ENVIRONMENT_ID;
+  const serviceObj = status?.service || findNamedObject(status, SERVICE_NAME);
+  const serviceId = serviceObj?.id || status?.serviceId || process.env.RAILWAY_SERVICE_ID;
 
   if (!projectId || !environmentId || !serviceId) {
-    throw new Error(
-      `Unable to resolve Railway context. Ensure the CLI is linked to project/environment/service ${SERVICE_NAME}.`
-    );
+    throw new Error(`Unable to resolve Railway context. Ensure the CLI is linked to project/environment/service ${SERVICE_NAME}.`);
   }
 
   return { projectId, environmentId, serviceId };
@@ -107,11 +93,7 @@ function resolveDatabaseUrl() {
 
   const vars = runJson('railway', ['variables', '--service', POSTGRES_SERVICE_NAME, '--json']);
   const value = extractVariable(vars, 'DATABASE_PUBLIC_URL');
-  if (!value) {
-    throw new Error(
-      `Unable to resolve DATABASE_PUBLIC_URL from Railway service ${POSTGRES_SERVICE_NAME}.`
-    );
-  }
+  if (!value) throw new Error(`Unable to resolve DATABASE_PUBLIC_URL from Railway service ${POSTGRES_SERVICE_NAME}.`);
   return value;
 }
 
@@ -140,30 +122,17 @@ async function getZone(domain) {
 }
 
 async function upsertCfRecord(zoneId, type, name, content, proxied = false) {
-  const lookup = await cfRequest(
-    `/zones/${zoneId}/dns_records?type=${encodeURIComponent(type)}&name=${encodeURIComponent(name)}`
-  );
+  const lookup = await cfRequest(`/zones/${zoneId}/dns_records?type=${encodeURIComponent(type)}&name=${encodeURIComponent(name)}`);
   const existing = lookup.result?.[0];
-  const payload = {
-    type,
-    name,
-    content,
-    ttl: 1,
-  };
+  const payload = { type, name, content, ttl: 1 };
   if (type === 'CNAME') payload.proxied = proxied;
 
   if (existing) {
-    await cfRequest(`/zones/${zoneId}/dns_records/${existing.id}`, {
-      method: 'PUT',
-      body: JSON.stringify(payload),
-    });
+    await cfRequest(`/zones/${zoneId}/dns_records/${existing.id}`, { method: 'PUT', body: JSON.stringify(payload) });
     return { action: 'updated', id: existing.id };
   }
 
-  const created = await cfRequest(`/zones/${zoneId}/dns_records`, {
-    method: 'POST',
-    body: JSON.stringify(payload),
-  });
+  const created = await cfRequest(`/zones/${zoneId}/dns_records`, { method: 'POST', body: JSON.stringify(payload) });
   return { action: 'created', id: created.result.id };
 }
 
@@ -195,13 +164,7 @@ query Domains($projectId: String!, $environmentId: String!, $serviceId: String!)
 
 function railwayDomains(context) {
   const variables = JSON.stringify(context);
-  const result = runJson('railway', [
-    'api',
-    DOMAINS_QUERY,
-    '--variables',
-    variables,
-    '--compact',
-  ]);
+  const result = runJson('railway', ['api', DOMAINS_QUERY, '--variables', variables, '--compact']);
   return result?.data?.domains?.customDomains || [];
 }
 
@@ -209,13 +172,18 @@ function getRailwayDomain(context, hostname) {
   return railwayDomains(context).find((d) => d.domain === hostname) || null;
 }
 
-function ensureRailwayCustomDomain(hostname) {
-  try {
-    run('railway', ['domain', hostname, '--json', '--service', SERVICE_NAME]);
-  } catch (error) {
-    const stderr = String(error.stderr || '');
-    if (!/already|exists|in use/i.test(stderr)) throw error;
+function ensureRailwayCustomDomain(context, hostname) {
+  const existing = getRailwayDomain(context, hostname);
+  if (existing) {
+    console.log(`[RAILWAY] existing custom domain: ${hostname}`);
+    return existing;
   }
+
+  run('railway', ['domain', hostname, '--json', '--service', SERVICE_NAME]);
+
+  const created = getRailwayDomain(context, hostname);
+  if (!created) throw new Error(`Railway custom domain not visible after create: ${hostname}`);
+  return created;
 }
 
 function getRoutingRecord(customDomain) {
@@ -278,8 +246,7 @@ async function listDomains(pool, onlyDomain) {
        tdt.tls_validated
      FROM control_plane.tenant_domains td
      JOIN control_plane.tenants t ON t.tenant_id = td.tenant_id
-     JOIN control_plane.tenant_domain_tracking tdt
-       ON tdt.tenant_domain_id = td.tenant_domain_id
+     JOIN control_plane.tenant_domain_tracking tdt ON tdt.tenant_domain_id = td.tenant_domain_id
      WHERE td.is_enabled = TRUE
        ${filter}
      ORDER BY t.tenant_key, td.domain`,
@@ -303,10 +270,7 @@ async function provisionOne(pool, context, row) {
   const hostname = row.tracking_host || `o.${row.domain}`;
   console.log(`\n[DOMAIN] ${row.tenant_key} ${row.domain} -> ${hostname}`);
 
-  ensureRailwayCustomDomain(hostname);
-
-  let railwayDomain = getRailwayDomain(context, hostname);
-  if (!railwayDomain) throw new Error(`Railway custom domain not visible after create: ${hostname}`);
+  let railwayDomain = ensureRailwayCustomDomain(context, hostname);
 
   const routing = getRoutingRecord(railwayDomain);
   const cnameTarget = routing?.requiredValue;
@@ -317,7 +281,6 @@ async function provisionOne(pool, context, row) {
   if (!verificationToken) throw new Error(`Railway did not return verificationToken for ${hostname}`);
 
   const zone = await getZone(row.domain);
-
   const cnameResult = await upsertCfRecord(zone.id, 'CNAME', hostname, cnameTarget, true);
   const txtResult = await upsertCfRecord(zone.id, 'TXT', verificationHost, verificationToken, false);
 
@@ -332,10 +295,7 @@ async function provisionOne(pool, context, row) {
   const health = await probe(hostname);
   await updateDomainState(pool, row.tenant_domain_id, dnsValidated, health.ok && tlsValidated);
 
-  console.log('[RAILWAY]', {
-    verified: dnsValidated,
-    certificateStatus: certificateStatus || null,
-  });
+  console.log('[RAILWAY]', { verified: dnsValidated, certificateStatus: certificateStatus || null });
   console.log('[HEALTH]', health);
 
   return {
