@@ -352,7 +352,7 @@ async function main() {
   requireEnv('CF_API_TOKEN');
   run('railway', ['whoami']);
 
-  const onlyDomain = process.argv.find((arg) => !arg.startsWith('-') && arg !== process.argv[1]);
+  const onlyDomain = process.argv.slice(2).find((arg) => !arg.startsWith('-')) || null;
   const context = getRailwayContext();
   const databaseUrl = resolveDatabaseUrl();
   const pool = new Pool({ connectionString: databaseUrl, ssl: { rejectUnauthorized: false }, max: 2 });
