@@ -11,7 +11,7 @@ app.disable('x-powered-by');
 app.set('trust proxy', true);
 
 const PORT = Number(process.env.PORT || process.env.HTTP_PORT || 8080);
-const CLASSIFIER_VERSION = process.env.CLASSIFIER_VERSION || 'oi-v1-observe';
+const CLASSIFIER_VERSION = process.env.CLASSIFIER_VERSION || 'oi-v1.1-observe';
 const IP_HASH_SALT = process.env.IP_HASH_SALT || '';
 
 function buildPool() {
@@ -94,8 +94,19 @@ function secondsBetween(later, earlier) {
   return Number.isFinite(delta) ? delta : null;
 }
 
-function classifyFetch({ userAgent, secondsSinceSent, secondsSinceDelivery }) {
+function looksLikeOutlookSecurityChrome109(ua) {
+  return (
+    ua.includes('windows nt 10.0; win64; x64') &&
+    ua.includes('applewebkit/537.36') &&
+    ua.includes('chrome/109.0.0.0') &&
+    ua.includes('safari/537.36') &&
+    !ua.includes('edg/')
+  );
+}
+
+function classifyFetch({ userAgent, recipientProvider, secondsSinceSent, secondsSinceDelivery }) {
   const ua = String(userAgent || '').toLowerCase();
+  const provider = String(recipientProvider || '').toLowerCase();
   const timing = secondsSinceDelivery ?? secondsSinceSent;
 
   const securityPatterns = [
@@ -119,6 +130,14 @@ function classifyFetch({ userAgent, secondsSinceSent, secondsSinceDelivery }) {
       classification: 'security_fetch',
       reason: 'known_security_user_agent',
       humanConfidence: 0.02,
+    };
+  }
+
+  if (provider === 'outlook' && looksLikeOutlookSecurityChrome109(ua)) {
+    return {
+      classification: 'security_fetch',
+      reason: 'outlook_security_chrome109_signature',
+      humanConfidence: 0.01,
     };
   }
 
@@ -186,7 +205,7 @@ const AGGREGATE_COLUMN_BY_CLASSIFICATION = Object.freeze({
 
 async function recordFetch(req, token) {
   const lookup = await pool.query(
-    `SELECT tracking_message_id, sent_at, delivered_at
+    `SELECT tracking_message_id, sent_at, delivered_at, recipient_provider
      FROM engagement.tracking_messages
      WHERE tracking_token = $1
        AND tracking_enabled = TRUE
@@ -208,7 +227,12 @@ async function recordFetch(req, token) {
   const secondsSinceSent = secondsBetween(now, message.sent_at);
   const secondsSinceDelivery = secondsBetween(now, message.delivered_at);
 
-  const decision = classifyFetch({ userAgent, secondsSinceSent, secondsSinceDelivery });
+  const decision = classifyFetch({
+    userAgent,
+    recipientProvider: message.recipient_provider,
+    secondsSinceSent,
+    secondsSinceDelivery,
+  });
   const ipHash = ip ? hashValue(ip, IP_HASH_SALT) : null;
   const requestFingerprint = hashValue(
     [userAgent, ipHash || '', referer, cfRay || ''].join('|'),
