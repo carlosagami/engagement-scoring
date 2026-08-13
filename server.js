@@ -11,7 +11,7 @@ app.disable('x-powered-by');
 app.set('trust proxy', true);
 
 const PORT = Number(process.env.PORT || process.env.HTTP_PORT || 8080);
-const CLASSIFIER_VERSION = process.env.CLASSIFIER_VERSION || 'oi-v1.1-observe';
+const CLASSIFIER_VERSION = process.env.CLASSIFIER_VERSION || 'oi-v1.2-observe';
 const IP_HASH_SALT = process.env.IP_HASH_SALT || '';
 
 function buildPool() {
@@ -167,6 +167,19 @@ function classifyFetch({ userAgent, recipientProvider, secondsSinceSent, seconds
       humanConfidence: null,
     };
   }
+
+const oneOutlookClient =
+  provider === 'outlook' &&
+  ua.includes('oneoutlook/') &&
+  ua.includes('edg/');
+
+if (oneOutlookClient) {
+  return {
+    classification: 'probable_human_open',
+    reason: 'oneoutlook_client_render',
+    humanConfidence: 0.85,
+  };
+}
 
   const directOutlookClient =
     ua.includes('microsoft outlook') ||
