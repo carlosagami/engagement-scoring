@@ -11,7 +11,7 @@ app.disable('x-powered-by');
 app.set('trust proxy', true);
 
 const PORT = Number(process.env.PORT || process.env.HTTP_PORT || 8080);
-const CLASSIFIER_VERSION = process.env.CLASSIFIER_VERSION || 'oi-v1.2-observe';
+const CLASSIFIER_VERSION = process.env.CLASSIFIER_VERSION || 'oi-v1.3-observe';
 const IP_HASH_SALT = process.env.IP_HASH_SALT || '';
 
 function buildPool() {
@@ -178,6 +178,28 @@ if (oneOutlookClient) {
     classification: 'probable_human_open',
     reason: 'oneoutlook_client_render',
     humanConfidence: 0.85,
+  };
+}
+
+const standardBrowser =
+  ua.includes('mozilla/5.0') &&
+  (
+    ua.includes('chrome/') ||
+    ua.includes('edg/') ||
+    ua.includes('firefox/') ||
+    ua.includes('safari/')
+  );
+
+if (
+  provider === 'outlook' &&
+  standardBrowser &&
+  timing !== null &&
+  timing >= 60
+) {
+  return {
+    classification: 'probable_human_open',
+    reason: 'outlook_browser_render_after_delay',
+    humanConfidence: 0.70,
   };
 }
 
