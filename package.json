@@ -5,12 +5,14 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "check": "node --check server.js && node --check scripts/provision-tracking-domains.js",
-    "domains:sync": "node scripts/provision-tracking-domains.js"
+    "check": "node --check server.js && node --check reporting-server.js && node --check daily-report.js && node --check scripts/provision-tracking-domains.js",
+    "domains:sync": "node scripts/provision-tracking-domains.js",
+    "report:daily": "node daily-report.js"
   },
   "dependencies": {
     "dotenv": "^16.0.3",
     "express": "^4.18.2",
+    "nodemailer": "^6.9.16",
     "pg": "^8.11.3"
   }
 }
