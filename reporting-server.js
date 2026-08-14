@@ -10,6 +10,9 @@ app.set('trust proxy', true);
 
 const PORT = Number(process.env.REPORTING_PORT || process.env.PORT || 8080);
 const REPORTING_READ_TOKEN = String(process.env.REPORTING_READ_TOKEN || '').trim();
+const REPORTING_TIMEZONE = String(
+  process.env.REPORTING_TIMEZONE || 'America/Mexico_City'
+).trim();
 
 function buildPool() {
   const connectionString = String(process.env.DATABASE_URL || '').trim();
@@ -54,20 +57,51 @@ function normalizeFilter(value) {
   return text || null;
 }
 
+function normalizeDate(value) {
+  const text = String(value || '').trim();
+
+  if (!text) return null;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(text)) return null;
+
+  return text;
+}
+
+function resolveDateRange(query) {
+  const start = normalizeDate(query.start);
+  const end = normalizeDate(query.end);
+
+  if (start || end) {
+    return {
+      mode: 'range',
+      start,
+      end,
+      days: null,
+    };
+  }
+
+  return {
+    mode: 'days',
+    start: null,
+    end: null,
+    days: clampDays(query.days),
+  };
+}
+
 function requireReadAccess(req, res, next) {
   if (!REPORTING_READ_TOKEN) {
     return next();
   }
 
   const authHeader = String(req.get('authorization') || '').trim();
-  const queryToken = String(req.query.token || '').trim();
+  const explicitToken = String(req.get('x-reporting-token') || '').trim();
+
   const bearer = authHeader.toLowerCase().startsWith('bearer ')
     ? authHeader.slice(7).trim()
     : '';
 
   if (
     bearer === REPORTING_READ_TOKEN ||
-    queryToken === REPORTING_READ_TOKEN
+    explicitToken === REPORTING_READ_TOKEN
   ) {
     return next();
   }
@@ -112,7 +146,7 @@ app.get('/health', async (_req, res) => {
 });
 
 app.get('/api/tenants', async (req, res) => {
-  const days = clampDays(req.query.days);
+  const range = resolveDateRange(req.query);
   const tenantKey = normalizeFilter(req.query.tenant);
 
   try {
@@ -167,19 +201,39 @@ app.get('/api/tenants', async (req, res) => {
       FROM engagement.message_open_summary mos
       JOIN control_plane.tenants t
         ON t.tenant_id = mos.tenant_id
-      WHERE mos.sent_at >= NOW() - ($1::int * INTERVAL '1 day')
-        AND ($2::text IS NULL OR lower(t.tenant_key) = lower($2))
+      WHERE
+        (
+          (
+            $1::text = 'days'
+            AND mos.sent_at >= NOW() - ($2::int * INTERVAL '1 day')
+          )
+          OR
+          (
+            $1::text = 'range'
+            AND ($3::date IS NULL OR mos.sent_at >= ($3::date::timestamp AT TIME ZONE $5))
+            AND ($4::date IS NULL OR mos.sent_at < (($4::date + 1)::timestamp AT TIME ZONE $5))
+          )
+        )
+        AND ($6::text IS NULL OR lower(t.tenant_key) = lower($6))
       GROUP BY
         t.tenant_id,
         t.tenant_key
       ORDER BY t.tenant_key
       `,
-      [days, tenantKey]
+      [
+        range.mode,
+        range.days || 7,
+        range.start,
+        range.end,
+        REPORTING_TIMEZONE,
+        tenantKey,
+      ]
     );
 
     return res.json({
       ok: true,
-      days,
+      range,
+      timezone: REPORTING_TIMEZONE,
       rows: result.rows,
     });
   } catch (error) {
@@ -193,7 +247,7 @@ app.get('/api/tenants', async (req, res) => {
 });
 
 app.get('/api/campaigns', async (req, res) => {
-  const days = clampDays(req.query.days);
+  const range = resolveDateRange(req.query);
   const tenantKey = normalizeFilter(req.query.tenant);
   const sendingDomain = normalizeFilter(req.query.domain);
 
@@ -247,10 +301,16 @@ app.get('/api/campaigns', async (req, res) => {
               AND mos.unique_human_open = TRUE
           ) AS median_seconds_to_first_open
         FROM engagement.message_open_summary mos
-        WHERE mos.sent_at >= NOW() - ($1::int * INTERVAL '1 day')
-          AND (
-            mos.dispatch_campaign_id IS NOT NULL
-            OR mos.sendy_campaign_id IS NOT NULL
+        WHERE
+          (
+            $1::text = 'days'
+            AND mos.sent_at >= NOW() - ($2::int * INTERVAL '1 day')
+          )
+          OR
+          (
+            $1::text = 'range'
+            AND ($3::date IS NULL OR mos.sent_at >= ($3::date::timestamp AT TIME ZONE $5))
+            AND ($4::date IS NULL OR mos.sent_at < (($4::date + 1)::timestamp AT TIME ZONE $5))
           )
         GROUP BY
           mos.tenant_id,
@@ -283,19 +343,32 @@ app.get('/api/campaigns', async (req, res) => {
         ON r.dispatch_campaign_id::text = cm.dispatch_campaign_id::text
       LEFT JOIN control_plane.campaign_content_snapshots ccs
         ON ccs.content_snapshot_id = r.content_snapshot_id
-      WHERE ($2::text IS NULL OR lower(t.tenant_key) = lower($2))
-        AND ($3::text IS NULL OR lower(cm.sending_domain) = lower($3))
+      WHERE ($6::text IS NULL OR lower(t.tenant_key) = lower($6))
+        AND ($7::text IS NULL OR lower(cm.sending_domain) = lower($7))
+        AND (
+          cm.dispatch_campaign_id IS NOT NULL
+          OR cm.sendy_campaign_id IS NOT NULL
+        )
       ORDER BY
         cm.last_sent_at DESC,
         t.tenant_key,
         cm.dispatch_campaign_id DESC
       `,
-      [days, tenantKey, sendingDomain]
+      [
+        range.mode,
+        range.days || 7,
+        range.start,
+        range.end,
+        REPORTING_TIMEZONE,
+        tenantKey,
+        sendingDomain,
+      ]
     );
 
     return res.json({
       ok: true,
-      days,
+      range,
+      timezone: REPORTING_TIMEZONE,
       rows: result.rows,
     });
   } catch (error) {
@@ -454,10 +527,14 @@ app.get('/', (_req, res) => {
         <option value="7">Últimos 7 días</option>
         <option value="14">Últimos 14 días</option>
         <option value="30">Últimos 30 días</option>
+        <option value="custom">Rango personalizado</option>
       </select>
 
+      <input id="start" type="date" aria-label="Desde">
+      <input id="end" type="date" aria-label="Hasta">
       <input id="tenant" placeholder="Tenant, ej. shopology">
       <input id="domain" placeholder="Dominio, ej. servireselcamino.com">
+      <input id="accessToken" type="password" placeholder="Token de acceso">
       <button id="refresh">Actualizar</button>
     </div>
 
@@ -487,8 +564,7 @@ app.get('/', (_req, res) => {
             <th>Tenant</th>
             <th>Asunto</th>
             <th>Dominio</th>
-            <th>Dispatch ID</th>
-            <th>Sendy ID</th>
+            <th>Fecha</th>
             <th>Entregados</th>
             <th>Unique Opens</th>
             <th>Open Rate</th>
@@ -540,15 +616,41 @@ app.get('/', (_req, res) => {
 
     async function load() {
       const days = document.getElementById('days').value;
+      const start = document.getElementById('start').value;
+      const end = document.getElementById('end').value;
       const tenant = document.getElementById('tenant').value.trim();
       const domain = document.getElementById('domain').value.trim();
+      const tokenInput = document.getElementById('accessToken');
+      const token = tokenInput.value.trim() || sessionStorage.getItem('reportingToken') || '';
 
-      const params = new URLSearchParams({ days });
+      if (tokenInput.value.trim()) {
+        sessionStorage.setItem('reportingToken', tokenInput.value.trim());
+      }
+
+      const params = new URLSearchParams();
+
+      if (days === 'custom') {
+        if (start) params.set('start', start);
+        if (end) params.set('end', end);
+      } else {
+        params.set('days', days);
+      }
 
       if (tenant) params.set('tenant', tenant);
       if (domain) params.set('domain', domain);
 
-      const response = await fetch('/api/campaigns?' + params.toString());
+      const headers = token
+        ? { Authorization: 'Bearer ' + token }
+        : {};
+
+      const response = await fetch(
+        '/api/campaigns?' + params.toString(),
+        { headers }
+      );
+
+      if (response.status === 401) {
+        throw new Error('Token de acceso inválido o faltante');
+      }
 
       if (!response.ok) {
         throw new Error('No se pudo cargar el reporte');
@@ -595,8 +697,7 @@ app.get('/', (_req, res) => {
           <td>\${escapeHtml(row.tenant_key || '')}</td>
           <td>\${escapeHtml(row.subject || 'Sin asunto disponible')}</td>
           <td>\${escapeHtml(row.sending_domain || '')}</td>
-          <td class="mono">\${escapeHtml(row.dispatch_campaign_id || '')}</td>
-          <td class="mono">\${escapeHtml(row.sendy_campaign_id || '')}</td>
+          <td>\${escapeHtml(dateLabel(row.last_sent_at))}</td>
           <td>\${escapeHtml(row.delivered_messages || 0)}</td>
           <td>\${escapeHtml(row.unique_human_opens || 0)}</td>
           <td>\${escapeHtml(row.open_rate_pct || 0)}%</td>
@@ -609,15 +710,33 @@ app.get('/', (_req, res) => {
       }
     }
 
+    const daysSelect = document.getElementById('days');
+    const startInput = document.getElementById('start');
+    const endInput = document.getElementById('end');
+    const tokenInput = document.getElementById('accessToken');
+
+    tokenInput.value = sessionStorage.getItem('reportingToken') || '';
+
+    function syncDateInputs() {
+      const custom = daysSelect.value === 'custom';
+      startInput.disabled = !custom;
+      endInput.disabled = !custom;
+    }
+
+    daysSelect.addEventListener('change', syncDateInputs);
+    syncDateInputs();
+
     document.getElementById('refresh').addEventListener('click', () => {
       load().catch((error) => {
         alert(error.message);
       });
     });
 
-    load().catch((error) => {
-      alert(error.message);
-    });
+    if (tokenInput.value) {
+      load().catch((error) => {
+        console.error(error);
+      });
+    }
   </script>
 </body>
 </html>`);
