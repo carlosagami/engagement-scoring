@@ -1,6 +1,9 @@
 const { Pool } = require('pg');
-const nodemailer = require('nodemailer');
+const { ClientCertificateCredential } = require('@azure/identity');
 const dotenv = require('dotenv');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 
 dotenv.config();
 
@@ -18,6 +21,12 @@ const REPORT_CC = String(process.env.REPORT_CC || 'jarvis@shopology.email')
   .split(',')
   .map((v) => v.trim())
   .filter(Boolean);
+
+function requiredEnv(name) {
+  const value = String(process.env[name] || '').trim();
+  if (!value) throw new Error(`Missing ${name}`);
+  return value;
+}
 
 function buildPool() {
   const connectionString = String(process.env.DATABASE_URL || '').trim();
@@ -44,33 +53,6 @@ function buildPool() {
     idleTimeoutMillis: 10000,
     connectionTimeoutMillis: 5000,
   });
-}
-
-function buildTransport() {
-  const host = String(process.env.REPORT_SMTP_HOST || '').trim();
-  const port = Number(process.env.REPORT_SMTP_PORT || 587);
-  const secure = String(process.env.REPORT_SMTP_SECURE || 'false').toLowerCase() === 'true';
-  const user = String(process.env.REPORT_SMTP_USER || '').trim();
-  const pass = String(process.env.REPORT_SMTP_PASS || '').trim();
-
-  if (!host) {
-    throw new Error('Missing REPORT_SMTP_HOST');
-  }
-
-  const options = {
-    host,
-    port,
-    secure,
-    connectionTimeout: 15000,
-    greetingTimeout: 15000,
-    socketTimeout: 30000,
-  };
-
-  if (user || pass) {
-    options.auth = { user, pass };
-  }
-
-  return nodemailer.createTransport(options);
 }
 
 function escapeHtml(value) {
@@ -255,11 +237,11 @@ function buildHtml(rows) {
 
           return `<section style="margin:28px 0 36px;">
             <h2 style="margin:0 0 12px;font-size:20px;">${escapeHtml(tenant)}</h2>
-            <div style="display:flex;gap:20px;flex-wrap:wrap;margin-bottom:14px;font-size:14px;">
-              <span><strong>Campañas:</strong> ${summary.campaigns}</span>
-              <span><strong>Entregados:</strong> ${summary.delivered}</span>
-              <span><strong>Aperturas únicas:</strong> ${summary.opens}</span>
-              <span><strong>Open rate:</strong> ${summary.rate.toFixed(2)}%</span>
+            <div style="margin-bottom:14px;font-size:14px;">
+              <strong>Campañas:</strong> ${summary.campaigns} &nbsp;·&nbsp;
+              <strong>Entregados:</strong> ${summary.delivered} &nbsp;·&nbsp;
+              <strong>Aperturas únicas:</strong> ${summary.opens} &nbsp;·&nbsp;
+              <strong>Open rate:</strong> ${summary.rate.toFixed(2)}%
             </div>
             <table style="width:100%;border-collapse:collapse;background:#fff;border:1px solid #e5e5e5;">
               <thead>
@@ -298,36 +280,69 @@ function buildHtml(rows) {
 </html>`;
 }
 
-function buildText(rows) {
-  const groups = groupByTenant(rows);
-  const lines = [
-    `PowerEmail - Reporte diario`,
-    `Últimos ${DAYS} días`,
-    '',
-  ];
+function graphRecipients(values) {
+  return values.map((address) => ({ emailAddress: { address } }));
+}
 
-  for (const [tenant, campaigns] of groups) {
-    const summary = tenantSummary(campaigns);
-    lines.push(tenant.toUpperCase());
-    lines.push(`Campañas: ${summary.campaigns}`);
-    lines.push(`Entregados: ${summary.delivered}`);
-    lines.push(`Aperturas únicas: ${summary.opens}`);
-    lines.push(`Open rate: ${summary.rate.toFixed(2)}%`);
-    lines.push('');
+function writeCertificateTempFile() {
+  const certBase64 = requiredEnv('MS_GRAPH_CERT_PEM_B64');
+  const pem = Buffer.from(certBase64, 'base64').toString('utf8');
 
-    for (const r of campaigns) {
-      lines.push(`- ${r.subject || 'Sin asunto disponible'}`);
-      lines.push(`  ${r.sending_domain || '—'} · ${r.delivered_messages || 0} entregados · ${r.unique_human_opens || 0} aperturas · ${pct(r.open_rate_pct)}`);
+  if (!pem.includes('BEGIN CERTIFICATE') || !pem.includes('PRIVATE KEY')) {
+    throw new Error('MS_GRAPH_CERT_PEM_B64 must contain a PEM certificate and private key');
+  }
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'poweremail-graph-'));
+  const certPath = path.join(dir, 'graph-auth.pem');
+  fs.writeFileSync(certPath, pem, { mode: 0o600 });
+  return { dir, certPath };
+}
+
+async function sendGraphMail({ subject, html }) {
+  const tenantId = requiredEnv('MS_GRAPH_TENANT_ID');
+  const clientId = requiredEnv('MS_GRAPH_CLIENT_ID');
+  const { dir, certPath } = writeCertificateTempFile();
+
+  try {
+    const credential = new ClientCertificateCredential(tenantId, clientId, certPath);
+    const token = await credential.getToken('https://graph.microsoft.com/.default');
+
+    if (!token || !token.token) {
+      throw new Error('Microsoft Graph token acquisition returned no token');
     }
 
-    lines.push('');
-  }
+    const uri = `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(REPORT_FROM)}/sendMail`;
+    const payload = {
+      message: {
+        subject,
+        body: {
+          contentType: 'HTML',
+          content: html,
+        },
+        toRecipients: graphRecipients(REPORT_TO),
+        ccRecipients: graphRecipients(REPORT_CC),
+      },
+      saveToSentItems: true,
+    };
 
-  if (groups.length === 0) {
-    lines.push(`No hubo campañas con identidad de campaña en los últimos ${DAYS} días.`);
-  }
+    const response = await fetch(uri, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token.token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload),
+    });
 
-  return lines.join('\n');
+    if (!response.ok) {
+      const detail = await response.text();
+      throw new Error(`Graph sendMail failed HTTP ${response.status}: ${detail}`);
+    }
+
+    return { status: response.status };
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 async function main() {
@@ -336,26 +351,15 @@ async function main() {
   try {
     const rows = await fetchCampaignRows(pool);
     const html = buildHtml(rows);
-    const text = buildText(rows);
-    const transporter = buildTransport();
-
-    await transporter.verify();
-
     const subject = `PowerEmail · Reporte diario últimos ${DAYS} días · ${localDateLabel()}`;
+    const result = await sendGraphMail({ subject, html });
 
-    const info = await transporter.sendMail({
+    console.log('[REPORT][SENT]', {
+      transport: 'microsoft-graph',
       from: REPORT_FROM,
       to: REPORT_TO,
       cc: REPORT_CC,
-      subject,
-      text,
-      html,
-    });
-
-    console.log('[REPORT][SENT]', {
-      messageId: info.messageId,
-      accepted: info.accepted,
-      rejected: info.rejected,
+      graphStatus: result.status,
       tenants: groupByTenant(rows).length,
       campaigns: rows.length,
     });
