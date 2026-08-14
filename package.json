@@ -10,6 +10,7 @@
     "report:daily": "node daily-report.js"
   },
   "dependencies": {
+    "@azure/identity": "^4.11.1",
     "dotenv": "^16.0.3",
     "express": "^4.18.2",
     "nodemailer": "^6.9.16",
