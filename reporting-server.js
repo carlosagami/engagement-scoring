@@ -532,7 +532,9 @@ app.get('/', (_req, res) => {
 
       <input id="start" type="date" aria-label="Desde">
       <input id="end" type="date" aria-label="Hasta">
-      <input id="tenant" placeholder="Tenant, ej. shopology">
+      <select id="tenant">
+        <option value="">Todos los tenants</option>
+      </select>
       <input id="domain" placeholder="Dominio, ej. servireselcamino.com">
       <input id="accessToken" type="password" placeholder="Token de acceso">
       <button id="refresh">Actualizar</button>
@@ -713,29 +715,113 @@ app.get('/', (_req, res) => {
     const daysSelect = document.getElementById('days');
     const startInput = document.getElementById('start');
     const endInput = document.getElementById('end');
+    const tenantSelect = document.getElementById('tenant');
     const tokenInput = document.getElementById('accessToken');
 
     tokenInput.value = sessionStorage.getItem('reportingToken') || '';
 
-    function syncDateInputs() {
-      const custom = daysSelect.value === 'custom';
-      startInput.disabled = !custom;
-      endInput.disabled = !custom;
+    function authHeaders() {
+      const token =
+        tokenInput.value.trim() ||
+        sessionStorage.getItem('reportingToken') ||
+        '';
+
+      return token
+        ? { Authorization: 'Bearer ' + token }
+        : {};
     }
 
-    daysSelect.addEventListener('change', syncDateInputs);
-    syncDateInputs();
+    async function loadTenants() {
+      const token = tokenInput.value.trim();
 
-    document.getElementById('refresh').addEventListener('click', () => {
-      load().catch((error) => {
+      if (token) {
+        sessionStorage.setItem('reportingToken', token);
+      }
+
+      const response = await fetch(
+        '/api/tenants?days=90',
+        { headers: authHeaders() }
+      );
+
+      if (response.status === 401) {
+        throw new Error('Ingresa un token de acceso válido');
+      }
+
+      if (!response.ok) {
+        throw new Error('No se pudieron cargar los tenants');
+      }
+
+      const payload = await response.json();
+      const current = tenantSelect.value;
+
+      tenantSelect.innerHTML =
+        '<option value="">Todos los tenants</option>';
+
+      for (const row of payload.rows || []) {
+        const option = document.createElement('option');
+        option.value = row.tenant_key;
+        option.textContent = row.tenant_key;
+        tenantSelect.appendChild(option);
+      }
+
+      if (
+        current &&
+        [...tenantSelect.options].some(
+          option => option.value === current
+        )
+      ) {
+        tenantSelect.value = current;
+      }
+    }
+
+    function useCustomRange() {
+      if (startInput.value || endInput.value) {
+        daysSelect.value = 'custom';
+      }
+    }
+
+    startInput.addEventListener('change', useCustomRange);
+    endInput.addEventListener('change', useCustomRange);
+
+    daysSelect.addEventListener('change', () => {
+      if (daysSelect.value !== 'custom') {
+        startInput.value = '';
+        endInput.value = '';
+      }
+    });
+
+    tokenInput.addEventListener('change', () => {
+      const token = tokenInput.value.trim();
+
+      if (token) {
+        sessionStorage.setItem('reportingToken', token);
+      } else {
+        sessionStorage.removeItem('reportingToken');
+      }
+    });
+
+    document.getElementById('refresh').addEventListener('click', async () => {
+      try {
+        if (!sessionStorage.getItem('reportingToken') && !tokenInput.value.trim()) {
+          throw new Error('Ingresa primero el token de acceso');
+        }
+
+        if (tenantSelect.options.length <= 1) {
+          await loadTenants();
+        }
+
+        await load();
+      } catch (error) {
         alert(error.message);
-      });
+      }
     });
 
     if (tokenInput.value) {
-      load().catch((error) => {
-        console.error(error);
-      });
+      loadTenants()
+        .then(() => load())
+        .catch((error) => {
+          console.error(error);
+        });
     }
   </script>
 </body>
