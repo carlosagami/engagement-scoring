@@ -1,0 +1,364 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PowerEmail Outlook Reporting</title>
+  <style>
+    :root {
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    body {
+      margin: 0;
+      background: #f5f5f5;
+      color: #111;
+    }
+
+    .wrap {
+      max-width: 1400px;
+      margin: 0 auto;
+      padding: 28px;
+    }
+
+    .account {
+      display: flex;
+      justify-content: flex-end;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 18px;
+      font-size: 13px;
+      color: #555;
+    }
+
+    .account a {
+      color: #111;
+    }
+
+    h1 {
+      margin: 0 0 6px;
+      font-size: 28px;
+    }
+
+    .sub {
+      margin: 0 0 24px;
+      color: #555;
+    }
+
+    .filters {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-bottom: 20px;
+    }
+
+    input,
+    select,
+    button {
+      font: inherit;
+      padding: 10px 12px;
+      border: 1px solid #ccc;
+      border-radius: 8px;
+      background: white;
+    }
+
+    button {
+      cursor: pointer;
+      font-weight: 600;
+    }
+
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+      margin-bottom: 20px;
+    }
+
+    .card {
+      background: white;
+      border-radius: 12px;
+      padding: 16px;
+      border: 1px solid #e6e6e6;
+    }
+
+    .card .label {
+      font-size: 12px;
+      color: #666;
+      text-transform: uppercase;
+      letter-spacing: .04em;
+    }
+
+    .card .value {
+      font-size: 28px;
+      font-weight: 700;
+      margin-top: 6px;
+    }
+
+    .table-wrap {
+      background: white;
+      border: 1px solid #e6e6e6;
+      border-radius: 12px;
+      overflow: auto;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      min-width: 1200px;
+    }
+
+    th,
+    td {
+      padding: 12px;
+      border-bottom: 1px solid #eee;
+      text-align: left;
+      vertical-align: top;
+      font-size: 14px;
+    }
+
+    th {
+      background: #fafafa;
+      position: sticky;
+      top: 0;
+      z-index: 1;
+      font-size: 12px;
+      text-transform: uppercase;
+      color: #555;
+    }
+
+    .empty {
+      padding: 28px;
+      color: #666;
+    }
+
+    @media (max-width: 900px) {
+      .cards {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      .wrap {
+        padding: 16px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="account">
+      <span><strong>{{USER_NAME}}</strong> · {{USER_EMAIL}}</span>
+      <a href="/auth/signout">Cerrar sesión</a>
+    </div>
+
+    <h1>PowerEmail · Outlook Reporting</h1>
+    <p class="sub">Campañas, entregas y aperturas humanas probables.</p>
+
+    <div class="filters">
+      <select id="days">
+        <option value="7">Últimos 7 días</option>
+        <option value="14">Últimos 14 días</option>
+        <option value="30">Últimos 30 días</option>
+        <option value="custom">Rango personalizado</option>
+      </select>
+
+      <input id="start" type="date" aria-label="Desde">
+      <input id="end" type="date" aria-label="Hasta">
+      <select id="tenant">
+        <option value="">Todos los tenants</option>
+      </select>
+      <input id="domain" placeholder="Dominio, ej. servireselcamino.com">
+      <button id="refresh">Actualizar</button>
+    </div>
+
+    <div class="cards">
+      <div class="card">
+        <div class="label">Campañas</div>
+        <div class="value" id="campaigns">0</div>
+      </div>
+      <div class="card">
+        <div class="label">Entregados</div>
+        <div class="value" id="delivered">0</div>
+      </div>
+      <div class="card">
+        <div class="label">Aperturas únicas</div>
+        <div class="value" id="opens">0</div>
+      </div>
+      <div class="card">
+        <div class="label">Open rate</div>
+        <div class="value" id="rate">0%</div>
+      </div>
+    </div>
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Tenant</th>
+            <th>Asunto</th>
+            <th>Dominio</th>
+            <th>Fecha</th>
+            <th>Entregados</th>
+            <th>Unique Opens</th>
+            <th>Open Rate</th>
+            <th>Promedio apertura</th>
+            <th>Mediana apertura</th>
+            <th>Último envío</th>
+          </tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+      <div id="empty" class="empty" hidden>No hay campañas para estos filtros.</div>
+    </div>
+  </div>
+
+  <script>
+    function secondsLabel(value) {
+      const seconds = Number(value);
+      if (!Number.isFinite(seconds)) return '—';
+      if (seconds < 60) return seconds.toFixed(1) + ' s';
+      const minutes = Math.floor(seconds / 60);
+      const remaining = Math.round(seconds % 60);
+      return minutes + 'm ' + remaining + 's';
+    }
+
+    function dateLabel(value) {
+      if (!value) return '—';
+      const d = new Date(value);
+      if (Number.isNaN(d.getTime())) return '—';
+      return d.toLocaleString();
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#039;');
+    }
+
+    async function apiFetch(url) {
+      const response = await fetch(url, { credentials: 'same-origin' });
+
+      if (response.status === 401) {
+        window.location.href = '/';
+        throw new Error('Tu sesión expiró. Vuelve a iniciar sesión con Microsoft.');
+      }
+
+      return response;
+    }
+
+    async function load() {
+      const days = document.getElementById('days').value;
+      const start = document.getElementById('start').value;
+      const end = document.getElementById('end').value;
+      const tenant = document.getElementById('tenant').value.trim();
+      const domain = document.getElementById('domain').value.trim();
+      const params = new URLSearchParams();
+
+      if (days === 'custom') {
+        if (start) params.set('start', start);
+        if (end) params.set('end', end);
+      } else {
+        params.set('days', days);
+      }
+
+      if (tenant) params.set('tenant', tenant);
+      if (domain) params.set('domain', domain);
+
+      const response = await apiFetch('/api/campaigns?' + params.toString());
+      if (!response.ok) throw new Error('No se pudo cargar el reporte');
+
+      const payload = await response.json();
+      const rows = payload.rows || [];
+      const delivered = rows.reduce((sum, row) => sum + Number(row.delivered_messages || 0), 0);
+      const opens = rows.reduce((sum, row) => sum + Number(row.unique_human_opens || 0), 0);
+      const rate = delivered > 0 ? (100 * opens / delivered).toFixed(2) : '0.00';
+
+      document.getElementById('campaigns').textContent = rows.length;
+      document.getElementById('delivered').textContent = delivered;
+      document.getElementById('opens').textContent = opens;
+      document.getElementById('rate').textContent = rate + '%';
+
+      const tbody = document.getElementById('rows');
+      const empty = document.getElementById('empty');
+      tbody.innerHTML = '';
+
+      if (rows.length === 0) {
+        empty.hidden = false;
+        return;
+      }
+
+      empty.hidden = true;
+
+      for (const row of rows) {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td>${escapeHtml(row.tenant_key || '')}</td>
+          <td>${escapeHtml(row.subject || 'Sin asunto disponible')}</td>
+          <td>${escapeHtml(row.sending_domain || '')}</td>
+          <td>${escapeHtml(dateLabel(row.last_sent_at))}</td>
+          <td>${escapeHtml(row.delivered_messages || 0)}</td>
+          <td>${escapeHtml(row.unique_human_opens || 0)}</td>
+          <td>${escapeHtml(row.open_rate_pct || 0)}%</td>
+          <td>${escapeHtml(secondsLabel(row.avg_seconds_to_first_open))}</td>
+          <td>${escapeHtml(secondsLabel(row.median_seconds_to_first_open))}</td>
+          <td>${escapeHtml(dateLabel(row.last_sent_at))}</td>
+        `;
+        tbody.appendChild(tr);
+      }
+    }
+
+    const daysSelect = document.getElementById('days');
+    const startInput = document.getElementById('start');
+    const endInput = document.getElementById('end');
+    const tenantSelect = document.getElementById('tenant');
+
+    async function loadTenants() {
+      const response = await apiFetch('/api/tenants?days=90');
+      if (!response.ok) throw new Error('No se pudieron cargar los tenants');
+
+      const payload = await response.json();
+      const current = tenantSelect.value;
+      tenantSelect.innerHTML = '<option value="">Todos los tenants</option>';
+
+      for (const row of payload.rows || []) {
+        const option = document.createElement('option');
+        option.value = row.tenant_key;
+        option.textContent = row.tenant_key;
+        tenantSelect.appendChild(option);
+      }
+
+      if (current && [...tenantSelect.options].some((option) => option.value === current)) {
+        tenantSelect.value = current;
+      }
+    }
+
+    function useCustomRange() {
+      if (startInput.value || endInput.value) daysSelect.value = 'custom';
+    }
+
+    startInput.addEventListener('change', useCustomRange);
+    endInput.addEventListener('change', useCustomRange);
+
+    daysSelect.addEventListener('change', () => {
+      if (daysSelect.value !== 'custom') {
+        startInput.value = '';
+        endInput.value = '';
+      }
+    });
+
+    document.getElementById('refresh').addEventListener('click', async () => {
+      try {
+        if (tenantSelect.options.length <= 1) await loadTenants();
+        await load();
+      } catch (error) {
+        alert(error.message);
+      }
+    });
+
+    loadTenants()
+      .then(() => load())
+      .catch((error) => console.error(error));
+  </script>
+</body>
+</html>
