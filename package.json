@@ -5,14 +5,17 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "check": "node --check server.js && node --check reporting-server.js && node --check daily-report.js && node --check scripts/provision-tracking-domains.js",
+    "reporting:start": "node reporting-auth-server.js",
+    "check": "node --check server.js && node --check reporting-server.js && node --check reporting-auth-server.js && node --check daily-report.js && node --check scripts/provision-tracking-domains.js",
     "domains:sync": "node scripts/provision-tracking-domains.js",
     "report:daily": "node daily-report.js"
   },
   "dependencies": {
     "@azure/identity": "^4.11.1",
+    "@azure/msal-node": "^3.7.3",
     "dotenv": "^16.0.3",
     "express": "^4.18.2",
+    "express-session": "^1.18.2",
     "nodemailer": "^6.9.16",
     "pg": "^8.11.3"
   }
