@@ -4,6 +4,8 @@ const PgSession = require('connect-pg-simple')(session);
 const { Pool } = require('pg');
 const { ConfidentialClientApplication } = require('@azure/msal-node');
 const { spawn } = require('child_process');
+const fs = require('fs');
+const path = require('path');
 const dotenv = require('dotenv');
 
 dotenv.config();
@@ -23,6 +25,7 @@ const REDIRECT_URI = String(process.env.M365_AUTH_REDIRECT_URI || 'https://power
 const SESSION_SECRET = String(process.env.SESSION_SECRET || '').trim();
 const DATABASE_URL = String(process.env.DATABASE_URL || '').trim();
 const REPORTING_READ_TOKEN = String(process.env.REPORTING_READ_TOKEN || '').trim();
+const DASHBOARD_TEMPLATE = fs.readFileSync(path.join(__dirname, 'reporting-dashboard.html'), 'utf8');
 const ALLOWED_USERS = new Set(
   String(process.env.REPORTING_ALLOWED_USERS || '')
     .split(',')
@@ -36,6 +39,7 @@ for (const [name, value] of Object.entries({
   M365_AUTH_CLIENT_SECRET: CLIENT_SECRET,
   SESSION_SECRET,
   DATABASE_URL,
+  REPORTING_READ_TOKEN,
 })) {
   if (!value) throw new Error(`Missing required environment variable ${name}`);
 }
@@ -94,18 +98,6 @@ function isAllowedUser(email) {
   return ALLOWED_USERS.has(email.toLowerCase());
 }
 
-function legacyTokenIsValid(req) {
-  if (!REPORTING_READ_TOKEN) return false;
-  const authHeader = String(req.get('authorization') || '').trim();
-  const explicitToken = String(req.get('x-reporting-token') || '').trim();
-  const bearer = authHeader.toLowerCase().startsWith('bearer ') ? authHeader.slice(7).trim() : '';
-  return bearer === REPORTING_READ_TOKEN || explicitToken === REPORTING_READ_TOKEN;
-}
-
-function apiAuthorized(req) {
-  return Boolean(req.session && req.session.user) || legacyTokenIsValid(req);
-}
-
 function escapeHtml(value) {
   return String(value || '')
     .replaceAll('&', '&amp;')
@@ -144,6 +136,12 @@ function loginPage(message = '') {
   </main>
 </body>
 </html>`;
+}
+
+function dashboardPage(user) {
+  return DASHBOARD_TEMPLATE
+    .replaceAll('{{USER_NAME}}', escapeHtml(user.name || user.email))
+    .replaceAll('{{USER_EMAIL}}', escapeHtml(user.email || ''));
 }
 
 app.get('/auth/signin', async (_req, res) => {
@@ -207,17 +205,14 @@ app.get('/auth/me', (req, res) => {
   return res.json({ ok: true, authenticated: true, user: req.session.user });
 });
 
-async function proxy(req, res, options = {}) {
+async function proxy(req, res) {
   const headers = {};
   for (const [key, value] of Object.entries(req.headers)) {
-    if (['host', 'connection', 'content-length'].includes(key.toLowerCase())) continue;
+    if (['host', 'connection', 'content-length', 'authorization', 'x-reporting-token'].includes(key.toLowerCase())) continue;
     if (value !== undefined) headers[key] = value;
   }
 
-  if (req.session && req.session.user && REPORTING_READ_TOKEN) {
-    headers['x-reporting-token'] = REPORTING_READ_TOKEN;
-    delete headers.authorization;
-  }
+  headers['x-reporting-token'] = REPORTING_READ_TOKEN;
 
   try {
     const upstream = await fetch(UPSTREAM + req.originalUrl, {
@@ -225,19 +220,7 @@ async function proxy(req, res, options = {}) {
       headers,
       redirect: 'manual',
     });
-    let body = Buffer.from(await upstream.arrayBuffer());
-    const contentType = upstream.headers.get('content-type') || '';
-
-    if (options.transformHtml && contentType.includes('text/html')) {
-      let html = body.toString('utf8');
-      const user = req.session.user;
-      const userName = escapeHtml(user.name || user.email);
-      const userEmail = escapeHtml(user.email || '');
-      html = html.replace('<input id="accessToken" type="password" placeholder="Token de acceso">', '<input id="accessToken" type="hidden" value="m365-session">');
-      html = html.replace('<div class="wrap">', `<div class="wrap"><div style="display:flex;justify-content:flex-end;align-items:center;gap:12px;margin-bottom:18px;font-size:13px;color:#555"><span><strong>${userName}</strong> · ${userEmail}</span><a href="/auth/signout" style="color:#111">Cerrar sesión</a></div>`);
-      html = html.replace('<script>', `<script>sessionStorage.setItem('reportingToken','m365-session');</script><script>`);
-      body = Buffer.from(html, 'utf8');
-    }
+    const body = Buffer.from(await upstream.arrayBuffer());
 
     for (const [key, value] of upstream.headers.entries()) {
       if (['content-length', 'content-encoding', 'transfer-encoding'].includes(key.toLowerCase())) continue;
@@ -253,13 +236,15 @@ async function proxy(req, res, options = {}) {
 app.get('/health', (req, res) => proxy(req, res));
 
 app.use('/api', (req, res) => {
-  if (!apiAuthorized(req)) return res.status(401).json({ ok: false, error: 'unauthorized' });
+  if (!req.session || !req.session.user) {
+    return res.status(401).json({ ok: false, error: 'unauthorized' });
+  }
   return proxy(req, res);
 });
 
 app.get('/', (req, res) => {
   if (!req.session || !req.session.user) return res.type('html').send(loginPage());
-  return proxy(req, res, { transformHtml: true });
+  return res.type('html').send(dashboardPage(req.session.user));
 });
 
 app.use((req, res) => {
