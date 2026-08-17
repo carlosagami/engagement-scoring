@@ -1,5 +1,7 @@
 const express = require('express');
 const session = require('express-session');
+const PgSession = require('connect-pg-simple')(session);
+const { Pool } = require('pg');
 const { ConfidentialClientApplication } = require('@azure/msal-node');
 const { spawn } = require('child_process');
 const dotenv = require('dotenv');
@@ -19,6 +21,7 @@ const CLIENT_ID = String(process.env.M365_AUTH_CLIENT_ID || '').trim();
 const CLIENT_SECRET = String(process.env.M365_AUTH_CLIENT_SECRET || '').trim();
 const REDIRECT_URI = String(process.env.M365_AUTH_REDIRECT_URI || 'https://poweremail.shopology.com.mx/auth/redirect').trim();
 const SESSION_SECRET = String(process.env.SESSION_SECRET || '').trim();
+const DATABASE_URL = String(process.env.DATABASE_URL || '').trim();
 const REPORTING_READ_TOKEN = String(process.env.REPORTING_READ_TOKEN || '').trim();
 const ALLOWED_USERS = new Set(
   String(process.env.REPORTING_ALLOWED_USERS || '')
@@ -32,9 +35,23 @@ for (const [name, value] of Object.entries({
   M365_AUTH_CLIENT_ID: CLIENT_ID,
   M365_AUTH_CLIENT_SECRET: CLIENT_SECRET,
   SESSION_SECRET,
+  DATABASE_URL,
 })) {
   if (!value) throw new Error(`Missing required environment variable ${name}`);
 }
+
+const sessionPool = new Pool({ connectionString: DATABASE_URL });
+
+sessionPool.on('error', (error) => {
+  console.error('[AUTH][SESSION_DB][ERROR]', error.message);
+});
+
+const sessionStore = new PgSession({
+  pool: sessionPool,
+  tableName: 'poweremail_reporting_sessions',
+  createTableIfMissing: true,
+  pruneSessionInterval: 15 * 60,
+});
 
 const msal = new ConfidentialClientApplication({
   auth: {
@@ -47,9 +64,11 @@ const msal = new ConfidentialClientApplication({
 app.use(
   session({
     name: 'poweremail.sid',
+    store: sessionStore,
     secret: SESSION_SECRET,
     resave: false,
     saveUninitialized: false,
+    rolling: true,
     cookie: {
       httpOnly: true,
       secure: true,
@@ -262,15 +281,28 @@ child.on('exit', (code, signal) => {
   process.exit(code || 1);
 });
 
-const server = app.listen(PORT, () => {
+const server = app.listen(PORT, async () => {
   console.log('[AUTH][BOOT] PowerEmail M365 gateway listening on ' + PORT);
   console.log('[AUTH][UPSTREAM] reporting-server on ' + UPSTREAM_PORT);
+
+  try {
+    await sessionPool.query('SELECT 1');
+    console.log('[AUTH][SESSION_DB] connected');
+  } catch (error) {
+    console.error('[AUTH][SESSION_DB][ERROR]', error.message);
+  }
 });
 
-function shutdown(signal) {
+async function shutdown(signal) {
   console.log('[AUTH][SYS] ' + signal + ' received');
   child.kill('SIGTERM');
-  server.close(() => process.exit(0));
+  server.close(async () => {
+    try {
+      await sessionPool.end();
+    } finally {
+      process.exit(0);
+    }
+  });
 }
 
 process.on('SIGTERM', () => shutdown('SIGTERM'));
