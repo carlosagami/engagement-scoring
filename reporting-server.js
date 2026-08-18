@@ -1,6 +1,7 @@
 const express = require('express');
 const { Pool } = require('pg');
 const dotenv = require('dotenv');
+const { filterCommercialCampaignRows } = require('./reporting-commercial-filter');
 
 dotenv.config();
 
@@ -215,6 +216,23 @@ app.get('/api/tenants', async (req, res) => {
           )
         )
         AND ($6::text IS NULL OR lower(t.tenant_key) = lower($6))
+        AND EXISTS (
+          SELECT 1
+          FROM engagement.tracking_messages tm
+          WHERE tm.tenant_id = mos.tenant_id
+            AND tm.tenant_lead_id IS NOT NULL
+            AND (
+              (
+                mos.dispatch_campaign_id IS NOT NULL
+                AND tm.dispatch_campaign_id::text = mos.dispatch_campaign_id::text
+              )
+              OR
+              (
+                mos.sendy_campaign_id IS NOT NULL
+                AND tm.sendy_campaign_id::text = mos.sendy_campaign_id::text
+              )
+            )
+        )
       GROUP BY
         t.tenant_id,
         t.tenant_key
@@ -365,11 +383,19 @@ app.get('/api/campaigns', async (req, res) => {
       ]
     );
 
+    const filtered = await filterCommercialCampaignRows(pool, result.rows);
+
+    if (filtered.excluded > 0) {
+      console.log('[REPORTING][CONTROL_SENDS_EXCLUDED]', {
+        excludedCampaigns: filtered.excluded,
+      });
+    }
+
     return res.json({
       ok: true,
       range,
       timezone: REPORTING_TIMEZONE,
-      rows: result.rows,
+      rows: filtered.rows,
     });
   } catch (error) {
     console.error('[CAMPAIGNS][ERROR]', error.message);
@@ -695,18 +721,18 @@ app.get('/', (_req, res) => {
       for (const row of rows) {
         const tr = document.createElement('tr');
 
-        tr.innerHTML = \`
-          <td>\${escapeHtml(row.tenant_key || '')}</td>
-          <td>\${escapeHtml(row.subject || 'Sin asunto disponible')}</td>
-          <td>\${escapeHtml(row.sending_domain || '')}</td>
-          <td>\${escapeHtml(dateLabel(row.last_sent_at))}</td>
-          <td>\${escapeHtml(row.delivered_messages || 0)}</td>
-          <td>\${escapeHtml(row.unique_human_opens || 0)}</td>
-          <td>\${escapeHtml(row.open_rate_pct || 0)}%</td>
-          <td>\${escapeHtml(secondsLabel(row.avg_seconds_to_first_open))}</td>
-          <td>\${escapeHtml(secondsLabel(row.median_seconds_to_first_open))}</td>
-          <td>\${escapeHtml(dateLabel(row.last_sent_at))}</td>
-        \`;
+        tr.innerHTML = `
+          <td>${escapeHtml(row.tenant_key || '')}</td>
+          <td>${escapeHtml(row.subject || 'Sin asunto disponible')}</td>
+          <td>${escapeHtml(row.sending_domain || '')}</td>
+          <td>${escapeHtml(dateLabel(row.last_sent_at))}</td>
+          <td>${escapeHtml(row.delivered_messages || 0)}</td>
+          <td>${escapeHtml(row.unique_human_opens || 0)}</td>
+          <td>${escapeHtml(row.open_rate_pct || 0)}%</td>
+          <td>${escapeHtml(secondsLabel(row.avg_seconds_to_first_open))}</td>
+          <td>${escapeHtml(secondsLabel(row.median_seconds_to_first_open))}</td>
+          <td>${escapeHtml(dateLabel(row.last_sent_at))}</td>
+        `;
 
         tbody.appendChild(tr);
       }
