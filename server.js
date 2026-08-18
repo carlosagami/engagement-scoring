@@ -1,598 +1,417 @@
-// ======================= ESP Server v5.2 (Engagement Scoring, Gmail+Outlook + Referer) =======================
-// - Webhook /webhook (Smartlead):
-//     * sent/click/reply actualizan métricas y score_v2
-//     * open SOLO registra actividad; NO suma opens humanos ni score_v2
-// - Píxel /o.gif:
-//     * ÚNICA fuente que:
-//         - incrementa open_count_v2
-//         - incrementa human_open_count
-//         - suma puntos de score_v2 por open (máx 1 vez por mid)
-//     * Heurística ultra-conservadora enfocada en GMAIL + OUTLOOK:
-//         - Si hay secondsSinceSend y es <5s → BOT
-//         - Gateways de seguridad → BOT
-//         - Gmail Image Proxy / Apple MPP / Outlook con delay → HUMANO
-//         - Si NO hay last_sent_v2:
-//               - Si UA es Gmail proxy / Apple MPP / Outlook → HUMANO probabilístico
-//               - Si no → BOT (reason=no_last_sent_v2)
-//     * Además, ahora logueamos REFERER en BOT y HUMAN para analizar Outlook web.
-// ============================================================================================================
-
-const express    = require('express');
-const { Pool }   = require('pg');
-const dotenv     = require('dotenv');
-const bodyParser = require('body-parser');
-const { Parser } = require('json2csv');
+const crypto = require('crypto');
+const net = require('net');
+const express = require('express');
+const { Pool } = require('pg');
+const dotenv = require('dotenv');
 
 dotenv.config();
 
-const app  = express();
-const port = process.env.PORT || 8080;
+const app = express();
+app.disable('x-powered-by');
+app.set('trust proxy', true);
 
-app.use(bodyParser.json());
+const PORT = Number(process.env.PORT || process.env.HTTP_PORT || 8080);
+const CLASSIFIER_VERSION = process.env.CLASSIFIER_VERSION || 'oi-v1.3-observe';
+const IP_HASH_SALT = process.env.IP_HASH_SALT || '';
 
-const pool = new Pool({
-  host:     process.env.PGHOST,
-  user:     process.env.PGUSER,
-  password: process.env.PGPASSWORD,
-  database: process.env.PGDATABASE,
-  port:     process.env.PGPORT,
-  ssl:      { rejectUnauthorized: false }
-});
+function buildPool() {
+  const connectionString = String(process.env.DATABASE_URL || '').trim();
+  if (connectionString) {
+    const internal = connectionString.includes('railway.internal');
+    return new Pool({
+      connectionString,
+      ssl: internal ? false : { rejectUnauthorized: false },
+      max: Number(process.env.PGPOOL_MAX || 10),
+      idleTimeoutMillis: 10000,
+      connectionTimeoutMillis: 5000,
+    });
+  }
 
-// -------------------------- Constantes & Config --------------------------
-
-const PIXEL_MIN_SECONDS_HUMAN   = 5;    // <5s desde last_sent_v2 = imposible humano (cuando sí hay timing)
-const GMAIL_MIN_SECONDS_HUMAN   = 10;   // mínimo para confiar en GoogleImageProxy SI hay timing
-const APPLE_MIN_SECONDS_HUMAN   = 10;   // mínimo para Apple MPP SI hay timing
-const OUTLOOK_MIN_SECONDS_HUMAN = 45;   // <45s desde envío → Outlook sospechoso SI hay timing
-
-// -------------------- Utilidades & Heurísticas --------------------
-
-function looksLikeSecurityGatewayUA(ua = '') {
-  const s = ua.toLowerCase();
-  return /(proofpoint|mimecast|barracuda|trendmicro|symantec|sophos)/.test(s);
+  return new Pool({
+    host: process.env.PGHOST,
+    user: process.env.PGUSER,
+    password: process.env.PGPASSWORD,
+    database: process.env.PGDATABASE,
+    port: Number(process.env.PGPORT || 5432),
+    ssl: { rejectUnauthorized: false },
+    max: Number(process.env.PGPOOL_MAX || 10),
+    idleTimeoutMillis: 10000,
+    connectionTimeoutMillis: 5000,
+  });
 }
 
-function looksLikeSecurityGatewayIP(ip = '') {
-  const s = String(ip || '').toLowerCase();
-  return /(proofpoint|mimecast|barracuda|trendmicro|symantec|sophos)/.test(s);
-}
+const pool = buildPool();
 
-function isGmailProxyUA(ua = '') {
-  const s = ua.toLowerCase();
-  return /googleimageproxy|ggpht\.com/.test(s);
-}
-
-function isAppleMPPProxyUA(ua = '') {
-  const s = ua.toLowerCase();
-  return /(apple|icloud).*(proxy|mail|mpp)/.test(s);
-}
-
-function isOutlookUA(ua = '') {
-  const s = ua.toLowerCase();
-  return /(microsoft outlook|ms-office|outlook|outlook-android|outlook-ios)/.test(s);
-}
-
-function sameDay(a, b) {
-  if (!a || !b) return false;
-  const A = new Date(a), B = new Date(b);
-  return A.toDateString() === B.toDateString();
-}
-
-function extractUA(payload, reqHeaders) {
-  return (
-    payload?.user_agent ||
-    payload?.ua ||
-    payload?.client?.user_agent ||
-    payload?.client?.ua ||
-    payload?.device?.user_agent ||
-    payload?.context?.userAgent ||
-    payload?.open?.user_agent ||
-    payload?.headers?.['User-Agent'] ||
-    reqHeaders['x-sl-user-agent'] ||
-    reqHeaders['x-user-agent'] ||
-    reqHeaders['user-agent'] ||
-    ''
-  );
-}
-
-function extractIP(payload, reqHeaders, reqIp) {
-  return (
-    payload?.ip ||
-    payload?.client?.ip ||
-    payload?.context?.ip ||
-    reqHeaders['x-real-ip'] ||
-    reqHeaders['x-forwarded-for'] ||
-    reqIp ||
-    ''
-  ).toString();
-}
-
-// GIF 1×1 transparente
 const GIF_1X1 = Buffer.from(
   '47494638396101000100800000ffffff00000021f90401000001002c00000000010001000002024401003b',
   'hex'
 );
 
 function sendGif(res) {
+  res.status(200);
   res.setHeader('Content-Type', 'image/gif');
-  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+  res.setHeader('Content-Length', String(GIF_1X1.length));
+  res.setHeader('Cache-Control', 'private, no-store, no-cache, must-revalidate, max-age=0');
   res.setHeader('Pragma', 'no-cache');
   res.setHeader('Expires', '0');
-  res.status(200).end(GIF_1X1, 'binary');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.end(GIF_1X1);
 }
 
-// ------------------ Clasificación del hit del píxel ------------------
-//
-// Solo consideramos HUMANO en estos casos:
-//   - Gmail proxy (GoogleImageProxy / ggpht) con delay (si hay timing) o sin timing (probabilístico)
-//   - Apple MPP proxy con delay (si hay timing) o sin timing (probabilístico)
-//   - Outlook con delay (si hay timing) o sin timing (probabilístico)
-//
-// TODO lo demás => BOT.
-//
-function classifyPixelOpen({ ua, ip, secondsSinceSend }) {
-  const uaLower = (ua || '').toLowerCase();
+function normalizeIp(raw) {
+  if (!raw) return null;
+  let value = String(raw).trim();
+  if (value.includes(',')) value = value.split(',')[0].trim();
+  if (value.startsWith('::ffff:')) value = value.slice(7);
+  if (value.startsWith('[')) {
+    const end = value.indexOf(']');
+    if (end > 0) value = value.slice(1, end);
+  } else if (value.includes('.') && value.includes(':')) {
+    value = value.split(':')[0];
+  }
+  return net.isIP(value) ? value : null;
+}
 
-  const gmailProxy  = isGmailProxyUA(uaLower);
-  const appleProxy  = isAppleMPPProxyUA(uaLower);
-  const outlookUA   = isOutlookUA(uaLower);
-  const isSecurityUA = looksLikeSecurityGatewayUA(uaLower);
-  const isSecurityIP = looksLikeSecurityGatewayIP(ip);
+function getClientIp(req) {
+  return (
+    normalizeIp(req.headers['cf-connecting-ip']) ||
+    normalizeIp(req.headers['x-forwarded-for']) ||
+    normalizeIp(req.headers['x-real-ip']) ||
+    normalizeIp(req.ip) ||
+    normalizeIp(req.socket?.remoteAddress) ||
+    null
+  );
+}
 
-  // 1) Gateways de seguridad claros → siempre BOT
-  if (isSecurityUA || isSecurityIP) {
+function hashValue(value, salt = '') {
+  if (!value) return null;
+  return crypto.createHash('sha256').update(`${salt}|${value}`).digest('hex');
+}
+
+function secondsBetween(later, earlier) {
+  if (!later || !earlier) return null;
+  const delta = (new Date(later).getTime() - new Date(earlier).getTime()) / 1000;
+  return Number.isFinite(delta) ? delta : null;
+}
+
+function looksLikeOutlookSecurityChrome109(ua) {
+  return (
+    ua.includes('windows nt 10.0; win64; x64') &&
+    ua.includes('applewebkit/537.36') &&
+    ua.includes('chrome/109.0.0.0') &&
+    ua.includes('safari/537.36') &&
+    !ua.includes('edg/')
+  );
+}
+
+function classifyFetch({ userAgent, recipientProvider, secondsSinceSent, secondsSinceDelivery }) {
+  const ua = String(userAgent || '').toLowerCase();
+  const provider = String(recipientProvider || '').toLowerCase();
+  const timing = secondsSinceDelivery ?? secondsSinceSent;
+
+  const securityPatterns = [
+    'proofpoint',
+    'mimecast',
+    'barracuda',
+    'trendmicro',
+    'trend micro',
+    'symantec',
+    'sophos',
+    'forcepoint',
+    'fortimail',
+    'fortinet',
+    'messagelabs',
+    'spamtitan',
+    'mailchannels',
+  ];
+
+  if (securityPatterns.some((pattern) => ua.includes(pattern))) {
     return {
-      isHuman: false,
-      isSuspicious: true,
-      secondsSinceSend,
-      reason: 'security_gateway'
+      classification: 'security_fetch',
+      reason: 'known_security_user_agent',
+      humanConfidence: 0.02,
     };
   }
 
-  const hasTiming = secondsSinceSend !== null && !Number.isNaN(secondsSinceSend);
-
-  // 2) Si TENEMOS timing, filtramos tooFast
-  if (hasTiming && secondsSinceSend < PIXEL_MIN_SECONDS_HUMAN) {
+  if (provider === 'outlook' && looksLikeOutlookSecurityChrome109(ua)) {
     return {
-      isHuman: false,
-      isSuspicious: true,
-      secondsSinceSend,
-      reason: `tooFast_${secondsSinceSend.toFixed(2)}s`
+      classification: 'security_fetch',
+      reason: 'outlook_security_chrome109_signature',
+      humanConfidence: 0.01,
     };
   }
 
-  // 3) Gmail proxy
-  if (gmailProxy) {
-    if (hasTiming && secondsSinceSend < GMAIL_MIN_SECONDS_HUMAN) {
-      return {
-        isHuman: false,
-        isSuspicious: true,
-        secondsSinceSend,
-        reason: `gmail_proxy_too_soon_${secondsSinceSend.toFixed(2)}s`
-      };
-    }
-
-    // SIN timing o con timing OK → lo consideramos HUMANO probabilístico
+  if (ua.includes('googleimageproxy') || ua.includes('ggpht.com')) {
     return {
-      isHuman: true,
-      isSuspicious: false,
-      secondsSinceSend,
-      reason: hasTiming ? 'gmail_proxy_after_delay' : 'gmail_proxy_no_last_sent'
+      classification: 'proxy_fetch',
+      reason: 'google_image_proxy',
+      humanConfidence: null,
     };
   }
 
-  // 4) Apple MPP
-  if (appleProxy) {
-    if (hasTiming && secondsSinceSend < APPLE_MIN_SECONDS_HUMAN) {
-      return {
-        isHuman: false,
-        isSuspicious: true,
-        secondsSinceSend,
-        reason: `apple_proxy_too_soon_${secondsSinceSend.toFixed(2)}s`
-      };
-    }
-
+  if (
+    (ua.includes('apple') || ua.includes('icloud')) &&
+    (ua.includes('proxy') || ua.includes('mpp') || ua.includes('mail'))
+  ) {
     return {
-      isHuman: true,
-      isSuspicious: false,
-      secondsSinceSend,
-      reason: hasTiming ? 'apple_mpp_after_delay' : 'apple_mpp_no_last_sent'
+      classification: 'proxy_fetch',
+      reason: 'apple_privacy_proxy',
+      humanConfidence: null,
     };
   }
 
-  // 5) Outlook REAL (desktop/web/mobile)
-  if (outlookUA) {
-    if (hasTiming && secondsSinceSend < OUTLOOK_MIN_SECONDS_HUMAN) {
-      return {
-        isHuman: false,
-        isSuspicious: true,
-        secondsSinceSend,
-        reason: `outlook_too_soon_${secondsSinceSend.toFixed(2)}s`
-      };
-    }
-
+  if (ua.includes('microsoft image proxy') || ua.includes('outlook image proxy')) {
     return {
-      isHuman: true,
-      isSuspicious: false,
-      secondsSinceSend,
-      reason: hasTiming ? 'outlook_after_delay' : 'outlook_no_last_sent'
+      classification: 'proxy_fetch',
+      reason: 'microsoft_image_proxy',
+      humanConfidence: null,
     };
   }
 
-  // 6) Si NO es Gmail/Apple/Outlook y además NO hay timing, marcamos explícito
-  if (!hasTiming) {
-    return {
-      isHuman: false,
-      isSuspicious: true,
-      secondsSinceSend,
-      reason: 'no_last_sent_v2'
-    };
-  }
+const oneOutlookClient =
+  provider === 'outlook' &&
+  ua.includes('oneoutlook/') &&
+  ua.includes('edg/');
 
-  // 7) Todo lo demás con timing → fallback BOT
+if (oneOutlookClient) {
   return {
-    isHuman: false,
-    isSuspicious: true,
-    secondsSinceSend,
-    reason: 'fallback_ua_ip'
+    classification: 'probable_human_open',
+    reason: 'oneoutlook_client_render',
+    humanConfidence: 0.85,
   };
 }
 
-// Keep-alive
-setInterval(() => console.log('🌀 [SYS] keepalive'), 25 * 1000);
+const standardBrowser =
+  ua.includes('mozilla/5.0') &&
+  (
+    ua.includes('chrome/') ||
+    ua.includes('edg/') ||
+    ua.includes('firefox/') ||
+    ua.includes('safari/')
+  );
 
-// -------------------------- Rutas lectura --------------------------
+if (
+  provider === 'outlook' &&
+  standardBrowser &&
+  timing !== null &&
+  timing >= 60
+) {
+  return {
+    classification: 'probable_human_open',
+    reason: 'outlook_browser_render_after_delay',
+    humanConfidence: 0.70,
+  };
+}
 
-app.get('/', (_req, res) => res.send('✅ API Engagement v5.2 funcionando correctamente'));
+  const directOutlookClient =
+    ua.includes('microsoft outlook') ||
+    ua.includes('outlook-android') ||
+    ua.includes('outlook-ios');
 
-app.get('/leads', async (_req, res) => {
-  try {
-    const { rows } = await pool.query('SELECT * FROM leads ORDER BY email');
-    res.json(rows);
-  } catch (err) {
-    console.error('⚠️ [LEADS][ERROR] al obtener leads:', err.message);
-    res.status(500).send('Error al obtener leads');
+  if (directOutlookClient && timing !== null && timing >= 30) {
+    return {
+      classification: 'probable_human_open',
+      reason: 'direct_outlook_client_plausible_timing',
+      humanConfidence: 0.75,
+    };
   }
+
+  if (timing !== null && timing >= 0 && timing < 5) {
+    return {
+      classification: 'unknown_fetch',
+      reason: 'very_early_fetch',
+      humanConfidence: 0.1,
+    };
+  }
+
+  return {
+    classification: 'unknown_fetch',
+    reason: ua ? 'unclassified_user_agent' : 'missing_user_agent',
+    humanConfidence: null,
+  };
+}
+
+const AGGREGATE_COLUMN_BY_CLASSIFICATION = Object.freeze({
+  security_fetch: 'security_fetch_count',
+  proxy_fetch: 'proxy_fetch_count',
+  probable_human_open: 'probable_human_fetch_count',
+  unknown_fetch: 'unknown_fetch_count',
 });
 
-app.get('/leads.csv', async (_req, res) => {
-  try {
-    const { rows } = await pool.query('SELECT * FROM leads ORDER BY email');
-    const parser = new Parser();
-    const csv = parser.parse(rows);
-    res.header('Content-Type', 'text/csv');
-    res.attachment('leads.csv');
-    res.send(csv);
-  } catch (err) {
-    console.error('⚠️ [LEADS][CSV][ERROR] al generar CSV:', err.message);
-    res.status(500).send('Error al generar CSV');
-  }
-});
+async function recordFetch(req, token) {
+  const lookup = await pool.query(
+    `SELECT tracking_message_id, sent_at, delivered_at, recipient_provider
+     FROM engagement.tracking_messages
+     WHERE tracking_token = $1
+       AND tracking_enabled = TRUE
+     LIMIT 1`,
+    [token]
+  );
 
-app.get('/leads/:email', async (req, res) => {
-  const { email } = req.params;
-  try {
-    const { rows } = await pool.query('SELECT * FROM leads WHERE email = $1', [email]);
-    if (rows.length === 0) return res.status(404).send('Lead no encontrado');
-    res.json(rows[0]);
-  } catch (err) {
-    console.error('⚠️ [LEADS][DETAIL][ERROR] al obtener lead:', err.message);
-    res.status(500).send('Error al obtener lead');
-  }
-});
-
-// --------------------------- Webhook v5.2 ----------------------------
-
-app.post('/webhook', async (req, res) => {
-  const data = req.body;
-
-  const rawType = (data.event_type || data.eventType || data.event || '').toLowerCase();
-  const email   = data.email || data.to_email || data.recipient;
-  const ts      = data.timestamp || data.time_sent || data.event_timestamp || data.occurred_at || new Date().toISOString();
-  const eventAt = new Date(ts);
-
-  console.log(`📩 [WEBHOOK][IN] type=${rawType || '-'} email=${email || '-'} ts=${ts}`);
-
-  if (!rawType || !email || !ts) {
-    console.log('⚠️ [WEBHOOK][SKIP] faltan datos clave');
-    return res.status(400).send('Faltan datos clave');
+  if (lookup.rowCount === 0) {
+    console.log('[OPEN][UNKNOWN_TOKEN]', { tokenHash: hashValue(token) });
+    return;
   }
 
-  const event_type =
-    /open/.test(rawType)          ? 'email_open'  :
-    /click/.test(rawType)         ? 'email_click' :
-    /reply|respond/.test(rawType) ? 'email_reply' :
-    /sent|delivered|delivery/.test(rawType)? 'email_sent'  :
-    rawType;
+  const message = lookup.rows[0];
+  const now = new Date();
+  const userAgent = String(req.get('user-agent') || '').slice(0, 4000);
+  const referer = String(req.get('referer') || '').slice(0, 4000);
+  const ip = getClientIp(req);
+  const cfRay = String(req.get('cf-ray') || '').slice(0, 255) || null;
+  const secondsSinceSent = secondsBetween(now, message.sent_at);
+  const secondsSinceDelivery = secondsBetween(now, message.delivered_at);
 
-  const ua = extractUA(data, req.headers);
-  const ip = extractIP(data, req.headers, req.ip);
+  const decision = classifyFetch({
+    userAgent,
+    recipientProvider: message.recipient_provider,
+    secondsSinceSent,
+    secondsSinceDelivery,
+  });
+  const ipHash = ip ? hashValue(ip, IP_HASH_SALT) : null;
+  const requestFingerprint = hashValue(
+    [userAgent, ipHash || '', referer, cfRay || ''].join('|'),
+    IP_HASH_SALT
+  );
 
-  const eventId = data.event_id || data.id || `${email}-${event_type}-${eventAt.getTime()}`;
+  const client = await pool.connect();
   try {
-    const { rowCount } = await pool.query(
-      `INSERT INTO lead_events_dedup (event_id, email, event_type)
-       VALUES ($1,$2,$3)
-       ON CONFLICT (event_id) DO NOTHING
-       RETURNING 1`,
-      [eventId, email, event_type]
+    await client.query('BEGIN');
+
+    const inserted = await client.query(
+      `INSERT INTO engagement.open_events (
+         tracking_message_id, occurred_at, classification, classification_reason,
+         human_confidence, user_agent, referer, ip_address, ip_hash,
+         seconds_since_sent, seconds_since_delivery, request_fingerprint, cf_ray
+       )
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+       RETURNING open_event_id`,
+      [
+        message.tracking_message_id,
+        now,
+        decision.classification,
+        decision.reason,
+        decision.humanConfidence,
+        userAgent || null,
+        referer || null,
+        ip,
+        ipHash,
+        secondsSinceSent,
+        secondsSinceDelivery,
+        requestFingerprint,
+        cfRay,
+      ]
     );
-    if (rowCount === 0) {
-      console.log(`♻️ [WEBHOOK][DEDUP] duplicate email=${email} type=${event_type}`);
-      return res.status(200).send('Evento duplicado ignorado');
-    }
-  } catch (e) {
-    console.warn('⚠️ [WEBHOOK][DEDUP][WARN]', e.message);
-  }
 
-  try {
-    let r = await pool.query('SELECT * FROM leads WHERE email = $1', [email]);
-    if (!r.rows[0]) {
-      await pool.query(
-        `INSERT INTO leads (email, send_count_v2, open_count_v2, human_open_count, suspicious_open_count,
-                            click_count_v2, reply_count_v2, score_v2, segment_v2)
-         VALUES ($1,0,0,0,0,0,0,0,'zombie')`,
-        [email]
-      );
-      r = await pool.query('SELECT * FROM leads WHERE email = $1', [email]);
-      console.log(`🆕 [WEBHOOK][NEW-LEAD] email=${email}`);
-    }
-    const lead = r.rows[0];
+    await client.query(
+      `INSERT INTO engagement.open_event_classifications (
+         open_event_id, classifier_version, classification, reason, human_confidence
+       ) VALUES ($1,$2,$3,$4,$5)`,
+      [
+        inserted.rows[0].open_event_id,
+        CLASSIFIER_VERSION,
+        decision.classification,
+        decision.reason,
+        decision.humanConfidence,
+      ]
+    );
 
-    const lastSentV2 = lead.last_sent_v2 ? new Date(lead.last_sent_v2) : null;
-    const secondsSinceSend = lastSentV2 ? (eventAt - lastSentV2) / 1000 : null;
-    const tooFast = secondsSinceSend !== null && secondsSinceSend < PIXEL_MIN_SECONDS_HUMAN;
+    const aggregateColumn = AGGREGATE_COLUMN_BY_CLASSIFICATION[decision.classification];
+    if (!aggregateColumn) throw new Error(`Unsupported classification: ${decision.classification}`);
 
-    let updates = [];
-    let values  = [email];
-    let i       = 2;
-    let newScore = lead.score_v2 || 0;
-    let segment  = lead.segment_v2 || 'zombie';
+    await client.query(
+      `UPDATE engagement.tracking_messages
+       SET first_fetch_at = COALESCE(first_fetch_at, $2),
+           last_fetch_at = $2,
+           raw_fetch_count = raw_fetch_count + 1,
+           ${aggregateColumn} = ${aggregateColumn} + 1,
+           updated_at = NOW()
+       WHERE tracking_message_id = $1`,
+      [message.tracking_message_id, now]
+    );
 
-    if (event_type === 'email_sent') {
-      updates.push(`send_count_v2 = COALESCE(send_count_v2,0) + 1`);
-      updates.push(`last_sent_v2 = $${i++}`); values.push(eventAt);
-    }
+    await client.query('COMMIT');
 
-    if (event_type === 'email_open') {
-      const uaIsSecurity = looksLikeSecurityGatewayUA(ua);
-      const ipIsSecurity = looksLikeSecurityGatewayIP(ip);
-      const isSuspicious =
-        uaIsSecurity || ipIsSecurity || tooFast;
-
-      updates.push(`last_open_v2 = $${i++}`); values.push(eventAt);
-
-      try {
-        await pool.query(
-          `INSERT INTO lead_open_events_v2 (email, opened_at, user_agent, ip, is_suspicious)
-           VALUES ($1,$2,$3,$4,$5)`,
-          [email, eventAt, ua, ip, isSuspicious]
-        );
-      } catch (e) {
-        console.warn('⚠️ [WEBHOOK][OPEN][WARN]', e.message);
-      }
-    }
-
-    if (event_type === 'email_click') {
-      updates.push(`last_click_v2 = $${i++}`); values.push(eventAt);
-      updates.push(`click_count_v2 = COALESCE(click_count_v2,0) + 1`);
-      newScore += 5;
-    }
-
-    if (event_type === 'email_reply') {
-      updates.push(`last_reply_v2 = $${i++}`); values.push(eventAt);
-      updates.push(`reply_count_v2 = COALESCE(reply_count_v2,0) + 1`);
-      newScore += 10;
-    }
-
-    if (event_type === 'email_click' || event_type === 'email_reply') {
-      const humanOpens = lead.human_open_count || 0;
-      const humanSignals =
-        (lead.reply_count_v2 > 0 || event_type === 'email_reply') ||
-        (lead.click_count_v2 > 0 || event_type === 'email_click') ||
-        (humanOpens >= 2);
-
-      if (humanSignals && newScore >= 12)      segment = 'vip';
-      else if (humanSignals && newScore >= 6)  segment = 'activo';
-      else if (newScore >= 2)                  segment = 'dormido';
-      else                                     segment = 'zombie';
-
-      updates.push(`score_v2 = $${i++}`);   values.push(newScore);
-      updates.push(`segment_v2 = $${i++}`); values.push(segment);
-    }
-
-    if (updates.length > 0) {
-      const sql = `UPDATE leads SET ${updates.join(', ')} WHERE email = $1`;
-      await pool.query(sql, values);
-    }
-
-    const secsStr = secondsSinceSend !== null ? ` secs=${secondsSinceSend.toFixed(2)}` : '';
-    console.log(`✅ [WEBHOOK][OK] email=${email} event=${event_type} seg=${segment} score=${newScore}${secsStr}`);
-
-    res.send('OK');
-  } catch (err) {
-    console.error('❌ [WEBHOOK][ERROR] procesando evento:', err.message);
-    res.status(500).send('Error interno');
-  }
-});
-
-// ------------------------- Píxel /o.gif v5.2 ---------------------------
-
-app.get('/o.gif', async (req, res) => {
-  try {
-    const email = (req.query.e || '').toString().trim().toLowerCase();
-    const mid   = (req.query.m || '').toString().trim();
-    const referer = req.headers['referer'] || req.headers['referrer'] || '';
-
-    if (!email) {
-      res.status(400).end();
-      return;
-    }
-
-    let r = await pool.query('SELECT * FROM leads WHERE email = $1', [email]);
-    if (!r.rows[0]) {
-      await pool.query(
-        `INSERT INTO leads (email, send_count_v2, open_count_v2, human_open_count, suspicious_open_count,
-                            click_count_v2, reply_count_v2, score_v2, segment_v2)
-         VALUES ($1,0,0,0,0,0,0,0,'zombie')`,
-        [email]
-      );
-      r = await pool.query('SELECT * FROM leads WHERE email = $1', [email]);
-      console.log(`🆕 [PIXEL][NEW-LEAD] email=${email}`);
-    }
-    const lead = r.rows[0];
-
-    const now = new Date();
-
-    const ua = req.headers['user-agent'] || '';
-    const ip = (req.headers['x-real-ip'] || req.headers['x-forwarded-for'] || req.ip || '').toString();
-
-    const lastSentV2 = lead.last_sent_v2 ? new Date(lead.last_sent_v2) : null;
-    const secondsSinceSend = lastSentV2 ? (now - lastSentV2) / 1000 : null;
-
-    const { isHuman, isSuspicious, reason } = classifyPixelOpen({
-      ua,
-      ip,
-      secondsSinceSend
+    console.log('[OPEN][RECORDED]', {
+      trackingMessageId: message.tracking_message_id,
+      classification: decision.classification,
+      reason: decision.reason,
+      secondsSinceSent,
+      secondsSinceDelivery,
     });
+  } catch (error) {
+    try { await client.query('ROLLBACK'); } catch (_) {}
+    throw error;
+  } finally {
+    client.release();
+  }
+}
 
-    // Guardar auditoría de open en lead_open_events_v2
-    try {
-      if (mid) {
-        const upd = await pool.query(
-          `UPDATE lead_open_events_v2
-           SET opened_at    = $3,
-               user_agent   = $4,
-               ip           = $5,
-               is_suspicious= $6
-           WHERE email = $1
-             AND message_base = $2`,
-          [email, mid, now, ua, ip, !!isSuspicious]
-        );
-
-        if (upd.rowCount === 0) {
-          await pool.query(
-            `INSERT INTO lead_open_events_v2 (email, message_base, opened_at, user_agent, ip, is_suspicious)
-             VALUES ($1,$2,$3,$4,$5,$6)`,
-            [email, mid, now, ua, ip, !!isSuspicious]
-          );
-        }
-      } else {
-        await pool.query(
-          `INSERT INTO lead_open_events_v2 (email, opened_at, user_agent, ip, is_suspicious)
-           VALUES ($1,$2,$3,$4,$5)`,
-          [email, now, ua, ip, !!isSuspicious]
-        );
-      }
-    } catch (e) {
-      console.warn('⚠️ [PIXEL][OPEN][WARN] al guardar open:', e.message);
-    }
-
-    if (!isHuman) {
-      try {
-        await pool.query(
-          `UPDATE leads
-           SET suspicious_open_count = COALESCE(suspicious_open_count,0) + 1,
-               last_open_v2 = $2
-           WHERE email = $1`,
-          [email, now]
-        );
-      } catch (e) {
-        console.warn('⚠️ [PIXEL][SUSP][WARN] al actualizar suspicious_open_count:', e.message);
-      }
-
-      const secsStr = secondsSinceSend !== null ? ` secs=${secondsSinceSend.toFixed(2)}` : ' secs=null';
-      console.log(
-        `🤖 [PIXEL][BOT] email=${email} mid=${mid || '-'} seg=${lead.segment_v2} score=${lead.score_v2}` +
-        ` reason=${reason || 'unknown'}${secsStr} ua="${ua}" referer="${referer}"`
-      );
-
-      sendGif(res);
-      return;
-    }
-
-    // HUMANO
-    let alreadyScored = false;
-    if (mid) {
-      try {
-        const { rowCount } = await pool.query(
-          `INSERT INTO lead_events_dedup (event_id, email, event_type)
-           VALUES ($1,$2,$3)
-           ON CONFLICT (event_id) DO NOTHING
-           RETURNING 1`,
-          [`pixel-score-${email}-${mid}`, email, 'email_open_pixel_score']
-        );
-        if (rowCount === 0) {
-          alreadyScored = true;
-        }
-      } catch (e) {
-        console.warn('⚠️ [PIXEL][SCORE-DEDUP][WARN]', e.message);
-      }
-    }
-
-    let updates = [];
-    let values  = [email];
-    let i       = 2;
-    let newScore = lead.score_v2 || 0;
-    let segment  = lead.segment_v2 || 'zombie';
-
-    updates.push(`last_open_v2 = $${i++}`); values.push(now);
-
-    let deltaHumanOpens = 0;
-    let scoredThisPixel = false;
-
-    if (!alreadyScored) {
-      updates.push(`open_count_v2 = COALESCE(open_count_v2,0) + 1`);
-      updates.push(`human_open_count = COALESCE(human_open_count,0) + 1`);
-      newScore += 1;
-      deltaHumanOpens = 1;
-      scoredThisPixel = true;
-    }
-
-    const futureHumanOpens =
-      (lead.human_open_count || 0) + deltaHumanOpens;
-
-    const humanSignals =
-      (lead.reply_count_v2 > 0) ||
-      (lead.click_count_v2 > 0) ||
-      (futureHumanOpens >= 2);
-
-    if (humanSignals && newScore >= 12)      segment = 'vip';
-    else if (humanSignals && newScore >= 6)  segment = 'activo';
-    else if (futureHumanOpens >= 1 && newScore >= 2)  segment = 'dormido';
-    else                                     segment = 'zombie';
-
-    updates.push(`score_v2 = $${i++}`);   values.push(newScore);
-    updates.push(`segment_v2 = $${i++}`); values.push(segment);
-
-    const sql = `UPDATE leads SET ${updates.join(', ')} WHERE email = $1`;
-    await pool.query(sql, values);
-
-    const secsStr = secondsSinceSend !== null ? ` secs=${secondsSinceSend.toFixed(2)}` : ' secs=null';
-    console.log(
-      `👀 [PIXEL][HUMAN] email=${email} mid=${mid || '-'} reason=${reason || 'unknown'}` +
-      ` scored=${scoredThisPixel} score=${lead.score_v2}->${newScore}` +
-      ` seg=${lead.segment_v2}->${segment}` +
-      ` opens=${lead.human_open_count || 0}->${(lead.human_open_count || 0) + deltaHumanOpens}` +
-      `${secsStr} ua="${ua}" referer="${referer}"`
+app.get('/health', async (_req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT
+         current_database() AS database,
+         to_regclass('engagement.tracking_messages') IS NOT NULL AS tracking_messages_ready,
+         to_regclass('engagement.open_events') IS NOT NULL AS open_events_ready`
     );
 
-    sendGif(res);
-  } catch (e) {
-    console.error('❌ [PIXEL][ERROR] en /o.gif:', e.message);
-    sendGif(res);
+    const row = result.rows[0];
+    const ready = row.tracking_messages_ready && row.open_events_ready;
+
+    res.status(ready ? 200 : 503).json({
+      ok: ready,
+      service: 'poweremail-open-intelligence',
+      classifierVersion: CLASSIFIER_VERSION,
+      database: row.database,
+    });
+  } catch (error) {
+    console.error('[HEALTH][ERROR]', error.message);
+    res.status(503).json({ ok: false, service: 'poweremail-open-intelligence' });
   }
 });
 
-// ----------------------------- Start ------------------------------
+app.get('/o/:token.gif', (req, res) => {
+  const token = String(req.params.token || '').trim();
+  const validToken = /^[A-Za-z0-9_-]{16,128}$/.test(token);
 
-app.listen(port, async () => {
-  console.log('🚀 API Engagement v5.2 corriendo en puerto ' + port);
+  sendGif(res);
+
+  if (!validToken) {
+    console.log('[OPEN][INVALID_TOKEN_FORMAT]');
+    return;
+  }
+
+  recordFetch(req, token).catch((error) => {
+    console.error('[OPEN][RECORD_ERROR]', error.message);
+  });
+});
+
+app.use((_req, res) => {
+  res.status(404).type('text/plain').send('not found');
+});
+
+const server = app.listen(PORT, async () => {
+  console.log(`[BOOT] poweremail-open-intelligence listening on ${PORT}`);
+  console.log(`[BOOT] classifier=${CLASSIFIER_VERSION}`);
   try {
-    await pool.query('SELECT NOW()');
-    console.log('✅ [DB] Conexión exitosa a PostgreSQL');
-  } catch (err) {
-    console.error('❌ [DB][ERROR] conectando a PostgreSQL:', err.message);
+    await pool.query('SELECT 1');
+    console.log('[DB] connected');
+  } catch (error) {
+    console.error('[DB][ERROR]', error.message);
   }
 });
+
+async function shutdown(signal) {
+  console.log(`[SYS] ${signal} received`);
+  server.close(async () => {
+    try {
+      await pool.end();
+    } finally {
+      process.exit(0);
+    }
+  });
+}
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
