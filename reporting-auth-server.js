@@ -223,7 +223,12 @@ async function proxy(req, res) {
     });
     let body = Buffer.from(await upstream.arrayBuffer());
 
-    if (upstream.ok && req.path === '/api/campaigns') {
+    const isCampaignsRoute =
+      req.path === '/campaigns' ||
+      req.path === '/api/campaigns' ||
+      String(req.originalUrl || '').split('?')[0] === '/api/campaigns';
+
+    if (upstream.ok && isCampaignsRoute) {
       try {
         const payload = JSON.parse(body.toString('utf8'));
         const filtered = await filterCommercialCampaignRows(sessionPool, payload.rows || []);
