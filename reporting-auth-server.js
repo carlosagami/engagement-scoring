@@ -209,7 +209,7 @@ app.get('/auth/me', (req, res) => {
 async function proxy(req, res) {
   const headers = {};
   for (const [key, value] of Object.entries(req.headers)) {
-    if (['host', 'connection', 'content-length', 'authorization', 'x-reporting-token'].includes(key.toLowerCase())) continue;
+    if (['host', 'connection', 'content-length', 'authorization', 'x-reporting-token', 'if-none-match', 'if-modified-since'].includes(key.toLowerCase())) continue;
     if (value !== undefined) headers[key] = value;
   }
 
@@ -223,6 +223,7 @@ async function proxy(req, res) {
     });
     let body = Buffer.from(await upstream.arrayBuffer());
 
+    const isApiRoute = String(req.originalUrl || '').split('?')[0].startsWith('/api/');
     const isCampaignsRoute =
       req.path === '/campaigns' ||
       req.path === '/api/campaigns' ||
@@ -247,9 +248,18 @@ async function proxy(req, res) {
     }
 
     for (const [key, value] of upstream.headers.entries()) {
-      if (['content-length', 'content-encoding', 'transfer-encoding'].includes(key.toLowerCase())) continue;
+      if (['content-length', 'content-encoding', 'transfer-encoding', 'etag', 'last-modified'].includes(key.toLowerCase())) continue;
+      if (isApiRoute && ['cache-control', 'expires', 'pragma'].includes(key.toLowerCase())) continue;
       res.setHeader(key, value);
     }
+
+    if (isApiRoute) {
+      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+      res.setHeader('Pragma', 'no-cache');
+      res.setHeader('Expires', '0');
+      res.setHeader('Surrogate-Control', 'no-store');
+    }
+
     return res.status(upstream.status).send(body);
   } catch (error) {
     console.error('[PROXY][ERROR]', error.message);
