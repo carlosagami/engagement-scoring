@@ -4,6 +4,7 @@ const dotenv = require('dotenv');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { filterCommercialCampaignRows } = require('./reporting-commercial-filter');
 
 dotenv.config();
 
@@ -186,7 +187,15 @@ async function fetchCampaignRows(pool) {
     [DAYS]
   );
 
-  return result.rows;
+  const filtered = await filterCommercialCampaignRows(pool, result.rows);
+
+  if (filtered.excluded > 0) {
+    console.log('[REPORT][CONTROL_SENDS_EXCLUDED]', {
+      excludedCampaigns: filtered.excluded,
+    });
+  }
+
+  return filtered.rows;
 }
 
 function groupByTenant(rows) {
@@ -260,7 +269,7 @@ function buildHtml(rows) {
           </section>`;
         })
         .join('')
-    : `<p>No hubo campañas con identidad de campaña en los últimos ${DAYS} días.</p>`;
+    : `<p>No hubo campañas comerciales con identidad de campaña en los últimos ${DAYS} días.</p>`;
 
   return `<!doctype html>
 <html lang="es">
@@ -273,7 +282,7 @@ function buildHtml(rows) {
       <h1 style="margin:0 0 6px;font-size:26px;">PowerEmail · Reporte diario</h1>
       <p style="margin:0;color:#555;">Últimos ${DAYS} días · generado ${escapeHtml(generatedAt)}</p>
       ${body}
-      <p style="margin-top:30px;color:#777;font-size:12px;">Fuente: PowerEmail Open Intelligence. Métricas de Outlook basadas en entregas registradas y aperturas humanas probables.</p>
+      <p style="margin-top:30px;color:#777;font-size:12px;">Fuente: PowerEmail Open Intelligence. Métricas de Outlook basadas en entregas registradas y aperturas humanas probables. Los envíos automáticos de control se excluyen del reporte.</p>
     </div>
   </div>
 </body>
