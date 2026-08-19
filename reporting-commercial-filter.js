@@ -39,6 +39,7 @@ async function filterCommercialCampaignRows(pool, rows) {
       r.dispatch_campaign_id::text AS dispatch_campaign_id,
       r.sendy_campaign_id::text AS sendy_campaign_id,
       r.source_system,
+      NULLIF(r.sendy_snapshot_json ->> 'parent_dispatch_campaign_id', '') AS parent_dispatch_campaign_id,
       COALESCE((r.sendy_snapshot_json ->> 'test_parent_alias')::boolean, false) AS test_parent_alias,
       COALESCE((r.sendy_snapshot_json ->> 'test_reserve_mirror')::boolean, false) AS test_reserve_mirror
     FROM control_plane.sendy_campaign_registry r
@@ -46,6 +47,11 @@ async function filterCommercialCampaignRows(pool, rows) {
       (cardinality($1::text[]) > 0 AND r.dispatch_campaign_id::text = ANY($1::text[]))
       OR
       (cardinality($2::text[]) > 0 AND r.sendy_campaign_id::text = ANY($2::text[]))
+      OR
+      (
+        cardinality($1::text[]) > 0
+        AND NULLIF(r.sendy_snapshot_json ->> 'parent_dispatch_campaign_id', '') = ANY($1::text[])
+      )
     `,
     [dispatchIds, sendyIds]
   );
@@ -64,6 +70,7 @@ async function filterCommercialCampaignRows(pool, rows) {
     const tenantId = String(row.tenant_id ?? '').trim();
     const dispatchId = String(row.dispatch_campaign_id ?? '').trim();
     const sendyId = String(row.sendy_campaign_id ?? '').trim();
+    const parentDispatchId = String(row.parent_dispatch_campaign_id ?? '').trim();
 
     if (tenantId && dispatchId) {
       excludedKeys.add(`${tenantId}|dispatch|${dispatchId}`);
@@ -71,6 +78,10 @@ async function filterCommercialCampaignRows(pool, rows) {
 
     if (tenantId && sendyId) {
       excludedKeys.add(`${tenantId}|sendy|${sendyId}`);
+    }
+
+    if (tenantId && parentDispatchId) {
+      excludedKeys.add(`${tenantId}|dispatch|${parentDispatchId}`);
     }
   }
 
