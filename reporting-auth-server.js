@@ -7,6 +7,7 @@ const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const dotenv = require('dotenv');
+const { filterCommercialCampaignRows } = require('./reporting-commercial-filter');
 
 dotenv.config();
 
@@ -220,7 +221,25 @@ async function proxy(req, res) {
       headers,
       redirect: 'manual',
     });
-    const body = Buffer.from(await upstream.arrayBuffer());
+    let body = Buffer.from(await upstream.arrayBuffer());
+
+    if (upstream.ok && req.path === '/api/campaigns') {
+      try {
+        const payload = JSON.parse(body.toString('utf8'));
+        const filtered = await filterCommercialCampaignRows(sessionPool, payload.rows || []);
+        payload.rows = filtered.rows;
+        body = Buffer.from(JSON.stringify(payload), 'utf8');
+
+        if (filtered.excluded > 0) {
+          console.log('[REPORTING][CONTROL_SENDS_EXCLUDED]', {
+            excludedCampaigns: filtered.excluded,
+          });
+        }
+      } catch (error) {
+        console.error('[REPORTING][FILTER][ERROR]', error.message);
+        return res.status(500).json({ ok: false, error: 'campaign_filter_failed' });
+      }
+    }
 
     for (const [key, value] of upstream.headers.entries()) {
       if (['content-length', 'content-encoding', 'transfer-encoding'].includes(key.toLowerCase())) continue;
